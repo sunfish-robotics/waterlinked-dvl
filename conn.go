@@ -1,15 +1,27 @@
 package dvl
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"sync"
+	"time"
 )
 
-// DefaultPort is the TCP port used by the A50/A125 JSON protocol.
-const DefaultPort = 16171
+const (
+	// DefaultPort is the TCP port used by the A50/A125 JSON protocol.
+	DefaultPort = 16171
 
-var errAPIScaffold = errors.New("dvl: protocol implementation is not available")
+	reportBufferCapacity   = 64
+	maximumFrameSize       = 1 << 20
+	commandResponseTimeout = 30 * time.Second
+)
+
+var errNilContext = errors.New("dvl: nil context")
 
 // Conn is one TCP connection epoch with a Water Linked DVL.
 //
@@ -23,14 +35,81 @@ type Conn struct {
 	state *connState
 }
 
-type connState struct{}
+type connState struct {
+	socket net.Conn
+
+	reports     chan Sample
+	reportInput chan Report
+	commands    chan commandRequest
+	done        chan struct{}
+	workers     sync.WaitGroup
+
+	terminalOnce sync.Once
+	errMu        sync.RWMutex
+	terminalErr  error
+
+	pendingMu sync.Mutex
+	pending   *pendingCommand
+}
+
+type commandRequest struct {
+	ctx      context.Context
+	name     string
+	payload  []byte
+	validate func(commandResponse) error
+	complete chan commandResult
+}
+
+type commandResult struct {
+	response commandResponse
+	err      error
+}
+
+type pendingCommand struct {
+	name      string
+	response  chan commandResponse
+	processed chan struct{}
+	delivered bool
+}
 
 // Dial connects to address, which must include a TCP port.
 //
-// Cancelling ctx while dialing returns ctx.Err. Once Dial succeeds, cancelling
-// ctx has no effect on the returned connection.
+// Cancelling ctx while dialing returns an error comparable with ctx.Err. Once
+// Dial succeeds, cancelling ctx has no effect on the returned connection.
 func Dial(ctx context.Context, address string) (*Conn, error) {
-	return nil, errAPIScaffold
+	if ctx == nil {
+		return nil, errNilContext
+	}
+
+	socket, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("dvl: dial %s: %w", address, err)
+	}
+
+	state := &connState{
+		socket:      socket,
+		reports:     make(chan Sample),
+		reportInput: make(chan Report),
+		commands:    make(chan commandRequest),
+		done:        make(chan struct{}),
+	}
+	conn := &Conn{state: state}
+
+	state.workers.Add(3)
+	go func() {
+		defer state.workers.Done()
+		state.runReportBroker()
+	}()
+	go func() {
+		defer state.workers.Done()
+		state.runCommands()
+	}()
+	go func() {
+		defer state.workers.Done()
+		state.readMessages()
+	}()
+
+	return conn, nil
 }
 
 // Reports returns the connection's report stream. Repeated calls return the
@@ -42,30 +121,55 @@ func Dial(ctx context.Context, address string) (*Conn, error) {
 // Sample reports any resulting loss. The channel closes when the connection
 // ends, and buffered reports from that connection epoch are discarded.
 func (c *Conn) Reports() <-chan Sample {
-	return nil
+	return c.state.reports
 }
 
 // Done is closed when the connection ends. It is a broadcast lifecycle signal
 // for supervisors and callers that do not consume Reports.
 func (c *Conn) Done() <-chan struct{} {
-	return nil
+	return c.state.done
 }
 
 // Err returns nil while the connection is active and its terminal cause after
 // Done is closed. The cause is stable and is not consumed by reading it.
 func (c *Conn) Err() error {
-	return errAPIScaffold
+	select {
+	case <-c.state.done:
+		c.state.errMu.RLock()
+		defer c.state.errMu.RUnlock()
+		return c.state.terminalErr
+	default:
+		return nil
+	}
 }
 
 // Info returns the connected device's identity, firmware version, and
 // readiness state.
 func (c *Conn) Info(ctx context.Context) (DeviceInfo, error) {
-	return DeviceInfo{}, errAPIScaffold
+	var info DeviceInfo
+	_, err := c.command(ctx, "get_version_info", nil, func(response commandResponse) error {
+		var decodeErr error
+		info, decodeErr = decodeDeviceInfo(response.Result, response.Format)
+		return decodeErr
+	})
+	if err != nil {
+		return DeviceInfo{}, err
+	}
+	return info, nil
 }
 
 // Config returns the complete configuration reported by the device.
 func (c *Conn) Config(ctx context.Context) (Config, error) {
-	return Config{}, errAPIScaffold
+	var config Config
+	_, err := c.command(ctx, "get_config", nil, func(response commandResponse) error {
+		var decodeErr error
+		config, decodeErr = decodeConfig(response.Result)
+		return decodeErr
+	})
+	if err != nil {
+		return Config{}, err
+	}
+	return config, nil
 }
 
 // UpdateConfig applies the non-nil fields in update.
@@ -74,29 +178,357 @@ func (c *Conn) Config(ctx context.Context) (Config, error) {
 // response means the device accepted the command; callers that need verified
 // application should read Config again and compare it with their desired state.
 func (c *Conn) UpdateConfig(ctx context.Context, update ConfigUpdate) error {
-	return errAPIScaffold
+	parameters, err := encodeConfigUpdate(update)
+	if err != nil {
+		return err
+	}
+	_, err = c.command(ctx, "set_config", parameters, nil)
+	return err
 }
 
 // ResetDeadReckoning resets the origin and attitude of the device's local
 // dead-reckoning frame. A successful response means the reset was accepted;
 // reports may take approximately 50 milliseconds to reach zero.
 func (c *Conn) ResetDeadReckoning(ctx context.Context) error {
-	return errAPIScaffold
+	_, err := c.command(ctx, "reset_dead_reckoning", nil, nil)
+	return err
 }
 
 // CalibrateGyro calibrates the A50/A125 gyroscope. The device must remain
 // stationary while calibration is in progress, which may take up to 15
 // seconds.
 func (c *Conn) CalibrateGyro(ctx context.Context) error {
-	return errAPIScaffold
+	_, err := c.command(ctx, "calibrate_gyro", nil, nil)
+	return err
 }
 
 // Close terminates the connection and unblocks pending operations. It is safe
-// to call Close more than once. Operations interrupted by Close return errors
-// comparable with net.ErrClosed; unexpected transport failures retain their
-// underlying EOF or network error.
+// to call Close more than once. When Close returns, Reports is closed and the
+// connection owns no running goroutines. Operations interrupted by Close
+// return errors comparable with net.ErrClosed; unexpected transport failures
+// retain their underlying EOF or network error.
 func (c *Conn) Close() error {
-	return errAPIScaffold
+	c.state.terminate(net.ErrClosed)
+	c.state.workers.Wait()
+	return nil
+}
+
+func (c *Conn) command(
+	ctx context.Context,
+	name string,
+	parameters map[string]any,
+	validate func(commandResponse) error,
+) (commandResponse, error) {
+	if ctx == nil {
+		return commandResponse{}, errNilContext
+	}
+
+	message := commandMessage{Command: name, Parameters: parameters}
+	payload, err := json.Marshal(message)
+	if err != nil {
+		return commandResponse{}, fmt.Errorf("dvl: encode command %q: %w", name, err)
+	}
+
+	request := commandRequest{
+		ctx:      ctx,
+		name:     name,
+		payload:  payload,
+		validate: validate,
+		complete: make(chan commandResult, 1),
+	}
+
+	select {
+	case c.state.commands <- request:
+	case <-ctx.Done():
+		return commandResponse{}, ctx.Err()
+	case <-c.state.done:
+		return commandResponse{}, c.Err()
+	}
+
+	select {
+	case result := <-request.complete:
+		if result.err != nil {
+			return commandResponse{}, result.err
+		}
+		if !result.response.Success {
+			return commandResponse{}, &CommandError{
+				Command: result.response.ResponseTo,
+				Message: result.response.ErrorMessage,
+			}
+		}
+		return result.response, nil
+	case <-ctx.Done():
+		return commandResponse{}, ctx.Err()
+	}
+}
+
+func (s *connState) runCommands() {
+	for {
+		select {
+		case <-s.done:
+			return
+		case request := <-s.commands:
+			select {
+			case <-s.done:
+				request.complete <- commandResult{err: s.err()}
+				return
+			default:
+			}
+			if err := request.ctx.Err(); err != nil {
+				request.complete <- commandResult{err: err}
+				continue
+			}
+			s.runCommand(request)
+		}
+	}
+}
+
+func (s *connState) runCommand(request commandRequest) {
+	pending := &pendingCommand{
+		name:      request.name,
+		response:  make(chan commandResponse, 1),
+		processed: make(chan struct{}),
+	}
+	s.pendingMu.Lock()
+	s.pending = pending
+	s.pendingMu.Unlock()
+
+	if err := s.writeCommand(request.payload); err != nil {
+		s.clearPending(pending)
+		terminalErr := fmt.Errorf("dvl: write command %q: %w", request.name, err)
+		s.terminate(terminalErr)
+		request.complete <- commandResult{err: s.err()}
+		return
+	}
+
+	timer := time.NewTimer(commandResponseTimeout)
+	defer timer.Stop()
+
+	select {
+	case response := <-pending.response:
+		s.finishCommand(request, pending, response)
+	case <-timer.C:
+		select {
+		case response := <-pending.response:
+			s.finishCommand(request, pending, response)
+			return
+		default:
+		}
+		s.clearPending(pending)
+		terminalErr := &ProtocolError{
+			Operation:   "wait for response",
+			MessageType: request.name,
+			Err:         context.DeadlineExceeded,
+		}
+		s.terminate(terminalErr)
+		request.complete <- commandResult{err: s.err()}
+	case <-s.done:
+		select {
+		case response := <-pending.response:
+			s.finishCommand(request, pending, response)
+			return
+		default:
+		}
+		s.clearPending(pending)
+		request.complete <- commandResult{err: s.err()}
+	}
+}
+
+func (s *connState) finishCommand(request commandRequest, pending *pendingCommand, response commandResponse) {
+	defer close(pending.processed)
+	s.clearPending(pending)
+	if response.Success && request.validate != nil {
+		if err := request.validate(response); err != nil {
+			terminalErr := &ProtocolError{
+				Operation:   "decode response",
+				MessageType: response.ResponseTo,
+				Err:         err,
+			}
+			s.terminate(terminalErr)
+			request.complete <- commandResult{err: s.err()}
+			return
+		}
+	}
+	request.complete <- commandResult{response: response}
+}
+
+func (s *connState) writeCommand(payload []byte) (err error) {
+	if err = s.socket.SetWriteDeadline(time.Now().Add(commandResponseTimeout)); err != nil {
+		return err
+	}
+	defer func() {
+		if resetErr := s.socket.SetWriteDeadline(time.Time{}); err == nil {
+			err = resetErr
+		}
+	}()
+
+	for len(payload) != 0 {
+		var written int
+		written, err = s.socket.Write(payload)
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+		payload = payload[written:]
+	}
+	return nil
+}
+
+func (s *connState) clearPending(pending *pendingCommand) {
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	if s.pending == pending {
+		s.pending = nil
+	}
+}
+
+func (s *connState) readMessages() {
+	scanner := bufio.NewScanner(s.socket)
+	scanner.Buffer(make([]byte, 4096), maximumFrameSize)
+
+	for scanner.Scan() {
+		frame := scanner.Bytes()
+		if len(frame) == 0 {
+			continue
+		}
+
+		report, response, messageType, err := decodeMessage(frame)
+		if err != nil {
+			s.terminate(&ProtocolError{
+				Operation:   "decode message",
+				MessageType: messageType,
+				Err:         err,
+			})
+			return
+		}
+
+		if response != nil {
+			if !s.deliverResponse(*response) {
+				return
+			}
+			continue
+		}
+
+		select {
+		case s.reportInput <- report:
+		case <-s.done:
+			return
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		s.terminate(fmt.Errorf("dvl: read: %w", err))
+		return
+	}
+	s.terminate(io.EOF)
+}
+
+func (s *connState) deliverResponse(response commandResponse) bool {
+	s.pendingMu.Lock()
+	pending := s.pending
+	if pending == nil {
+		s.pendingMu.Unlock()
+		s.terminate(&ProtocolError{
+			Operation:   "correlate response",
+			MessageType: response.ResponseTo,
+			Err:         errors.New("response has no pending command"),
+		})
+		return false
+	}
+	if response.ResponseTo != pending.name {
+		expected := pending.name
+		s.pendingMu.Unlock()
+		s.terminate(&ProtocolError{
+			Operation:   "correlate response",
+			MessageType: response.ResponseTo,
+			Err:         fmt.Errorf("response is for %q, want %q", response.ResponseTo, expected),
+		})
+		return false
+	}
+	if pending.delivered {
+		s.pendingMu.Unlock()
+		s.terminate(&ProtocolError{
+			Operation:   "correlate response",
+			MessageType: response.ResponseTo,
+			Err:         errors.New("duplicate response"),
+		})
+		return false
+	}
+	pending.delivered = true
+	responseChannel := pending.response
+	s.pendingMu.Unlock()
+
+	responseChannel <- response
+	select {
+	case <-pending.processed:
+		return true
+	case <-s.done:
+		return false
+	}
+}
+
+func (s *connState) runReportBroker() {
+	defer close(s.reports)
+
+	queue := make([]Report, reportBufferCapacity)
+	head := 0
+	size := 0
+	var dropped uint64
+
+	for {
+		select {
+		case <-s.done:
+			return
+		default:
+		}
+
+		var output chan Sample
+		var sample Sample
+		if size != 0 {
+			output = s.reports
+			sample = Sample{Report: queue[head], DroppedBefore: dropped}
+		}
+
+		select {
+		case <-s.done:
+			return
+		case report := <-s.reportInput:
+			if size == len(queue) {
+				queue[head] = nil
+				head = (head + 1) % len(queue)
+				size--
+				dropped++
+			}
+			queue[(head+size)%len(queue)] = report
+			size++
+		case output <- sample:
+			queue[head] = nil
+			head = (head + 1) % len(queue)
+			size--
+			dropped = 0
+		}
+	}
+}
+
+func (s *connState) terminate(err error) {
+	if err == nil {
+		err = io.EOF
+	}
+	s.terminalOnce.Do(func() {
+		s.errMu.Lock()
+		s.terminalErr = err
+		s.errMu.Unlock()
+		_ = s.socket.Close()
+		close(s.done)
+	})
+}
+
+func (s *connState) err() error {
+	s.errMu.RLock()
+	defer s.errMu.RUnlock()
+	return s.terminalErr
 }
 
 // CommandError reports a syntactically valid command rejected by the device.

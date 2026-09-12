@@ -23,7 +23,9 @@ type Sample struct {
 	DroppedBefore uint64
 }
 
-// ProtocolVersion is the format identifier carried by a device message.
+// ProtocolVersion is the format identifier carried by a device message. The
+// client accepts the backwards-compatible json_v3 family and rejects other
+// major versions with ProtocolError.
 type ProtocolVersion string
 
 const (

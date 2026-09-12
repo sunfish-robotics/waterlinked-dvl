@@ -30,7 +30,7 @@ supports:
 
 Each connection represents one TCP epoch. When the connection ends, the caller
 opens a new one and decides how and when to retry. Measurements remain in the
-in the frame emitted by the DVL so callers can apply installation-specific
+frame emitted by the DVL so callers can apply installation-specific
 transformations deliberately.
 
 ## Requirements
