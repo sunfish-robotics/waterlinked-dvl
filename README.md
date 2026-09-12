@@ -21,13 +21,15 @@ The package connects to the configured DVL TCP endpoint on port `16171` and
 supports:
 
 - newline-delimited `velocity`, `velocity_water`, and `position_local` reports;
+- a receive-only report stream with explicit dropped-report counts when a consumer falls behind;
 - complete timing, covariance, validity, status, and per-transducer fields;
 - typed device identity and configuration commands;
-- interleaved report and command-response handling; and
-- explicit connection, cancellation, command, and protocol errors.
+- interleaved report and command-response handling;
+- broadcast connection lifecycle with a durable terminal error; and
+- explicit cancellation, command, and protocol errors.
 
-Each client represents one TCP connection epoch. When the connection ends, the
-caller opens a new client and decides how and when to retry. Measurements remain
+Each connection represents one TCP epoch. When the connection ends, the caller
+opens a new one and decides how and when to retry. Measurements remain in the
 in the frame emitted by the DVL so callers can apply installation-specific
 transformations deliberately.
 
