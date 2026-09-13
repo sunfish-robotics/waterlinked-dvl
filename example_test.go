@@ -3,16 +3,16 @@ package dvl_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
-	"strconv"
 
 	dvl "github.com/sunfish-robotics/waterlinked-dvl"
 )
 
-func ExampleConn_Reports() {
+func ExampleConn_VelocityReports() {
 	ctx := context.Background()
-	address := net.JoinHostPort("192.168.194.95", strconv.Itoa(dvl.DefaultPort))
+	address := fmt.Sprintf("192.168.194.95:%d", dvl.DefaultPort)
 
 	conn, err := dvl.Dial(ctx, address)
 	if err != nil {
@@ -20,33 +20,22 @@ func ExampleConn_Reports() {
 	}
 	defer conn.Close()
 
-	for sample := range conn.Reports() {
+	for sample := range conn.VelocityReports() {
 		if sample.DroppedBefore != 0 {
-			log.Printf("DVL report consumer fell behind: dropped %d reports", sample.DroppedBefore)
+			log.Printf("DVL velocity consumer fell behind: dropped %d reports", sample.DroppedBefore)
 		}
 
-		switch report := sample.Report.(type) {
-		case *dvl.VelocityReport:
-			if !report.Valid {
-				continue
-			}
-			log.Printf(
-				"%s-relative velocity: x=%.3f y=%.3f z=%.3f m/s",
-				report.Reference,
-				report.Velocity.X,
-				report.Velocity.Y,
-				report.Velocity.Z,
-			)
-		case *dvl.DeadReckoningReport:
-			log.Printf(
-				"local position: x=%.2f y=%.2f z=%.2f m",
-				report.Position.X,
-				report.Position.Y,
-				report.Position.Z,
-			)
-		case *dvl.UnknownReport:
-			log.Printf("unknown DVL report type %q", report.Type)
+		report := sample.Report
+		if !report.Valid {
+			continue
 		}
+		log.Printf(
+			"%s-relative velocity: x=%.3f y=%.3f z=%.3f m/s",
+			report.Reference,
+			report.Velocity.X,
+			report.Velocity.Y,
+			report.Velocity.Z,
+		)
 	}
 
 	if err := conn.Err(); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -56,7 +45,7 @@ func ExampleConn_Reports() {
 
 func ExampleConn_UpdateConfig() {
 	ctx := context.Background()
-	address := net.JoinHostPort("192.168.194.95", strconv.Itoa(dvl.DefaultPort))
+	address := fmt.Sprintf("192.168.194.95:%d", dvl.DefaultPort)
 
 	conn, err := dvl.Dial(ctx, address)
 	if err != nil {
@@ -88,5 +77,47 @@ func ExampleConn_UpdateConfig() {
 			"DVL accepted speed-of-sound update but reports %.1f m/s",
 			after.SpeedOfSound,
 		)
+	}
+}
+
+func ExampleConn() {
+	ctx := context.Background()
+	address := fmt.Sprintf("192.168.194.95:%d", dvl.DefaultPort)
+
+	conn, err := dvl.Dial(ctx, address)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	velocityReports := conn.VelocityReports()
+	deadReckoningReports := conn.DeadReckoningReports()
+	unknownReports := conn.UnknownReports()
+	for {
+		select {
+		case sample, ok := <-velocityReports:
+			if !ok {
+				velocityReports = nil
+				continue
+			}
+			log.Printf("Velocity: %v", sample.Report)
+		case sample, ok := <-deadReckoningReports:
+			if !ok {
+				deadReckoningReports = nil
+				continue
+			}
+			log.Printf("Dead reckoning: %v", sample.Report)
+		case sample, ok := <-unknownReports:
+			if !ok {
+				unknownReports = nil
+				continue
+			}
+			log.Printf("Unknown report: %v", sample.Report)
+		case <-conn.Done():
+			if err := conn.Err(); err != nil && !errors.Is(err, net.ErrClosed) {
+				log.Printf("DVL connection ended: %v", err)
+			}
+			return
+		}
 	}
 }

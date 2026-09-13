@@ -12,20 +12,20 @@ const velocityFixture = `{"time":189.83340454101562,"vx":0.00046143701183609664,
 func TestDecodeVelocityReportFromZoda(t *testing.T) {
 	t.Parallel()
 
-	report, response, messageType, err := decodeMessage([]byte(velocityFixture))
+	message, err := decodeMessage([]byte(velocityFixture))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if response != nil {
+	if message.response != nil {
 		t.Fatal("velocity decoded as response")
 	}
-	if messageType != "velocity" {
-		t.Fatalf("message type = %q", messageType)
+	if message.messageType != "velocity" {
+		t.Fatalf("message type = %q", message.messageType)
 	}
 
-	velocity, ok := report.(*VelocityReport)
-	if !ok {
-		t.Fatalf("report type = %T", report)
+	velocity := message.velocity
+	if velocity == nil {
+		t.Fatal("velocity report is nil")
 	}
 	if velocity.Reference != VelocityReferenceBottom {
 		t.Fatalf("reference = %q", velocity.Reference)
@@ -73,11 +73,14 @@ func TestDecodeWaterVelocityWithoutAltitude(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	report, _, _, err := decodeMessage(data)
+	decoded, err := decodeMessage(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	velocity := report.(*VelocityReport)
+	velocity := decoded.velocity
+	if velocity == nil {
+		t.Fatal("velocity report is nil")
+	}
 	if velocity.Reference != VelocityReferenceWater {
 		t.Fatalf("reference = %q", velocity.Reference)
 	}
@@ -90,11 +93,14 @@ func TestDecodeDeadReckoningReport(t *testing.T) {
 	t.Parallel()
 
 	data := []byte(`{"ts":1789228180.928221,"x":12.4,"y":64.6,"z":1.7,"std":0.002,"roll":0.6,"pitch":0.7,"yaw":90.1,"type":"position_local","status":0,"format":"json_v3.3"}`)
-	report, _, _, err := decodeMessage(data)
+	message, err := decodeMessage(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	position := report.(*DeadReckoningReport)
+	position := message.deadReckoning
+	if position == nil {
+		t.Fatal("dead-reckoning report is nil")
+	}
 	if !position.At.Equal(time.Unix(1789228180, 928221000)) {
 		t.Fatalf("timestamp = %s", position.At)
 	}
@@ -110,11 +116,14 @@ func TestDecodeUnknownReportOwnsRawMessage(t *testing.T) {
 	t.Parallel()
 
 	data := []byte(`{"type":"temperature","format":"json_v3.4","celsius":20}`)
-	report, _, _, err := decodeMessage(data)
+	message, err := decodeMessage(data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	unknown := report.(*UnknownReport)
+	unknown := message.unknown
+	if unknown == nil {
+		t.Fatal("unknown report is nil")
+	}
 	data[0] = 'x'
 	if !json.Valid(unknown.Raw) {
 		t.Fatalf("raw message aliases input: %q", unknown.Raw)
@@ -127,7 +136,7 @@ func TestDecodeUnknownReportOwnsRawMessage(t *testing.T) {
 func TestDecodeRejectsUnsupportedProtocolMajor(t *testing.T) {
 	t.Parallel()
 
-	_, _, _, err := decodeMessage([]byte(`{"type":"temperature","format":"json_v4.0","celsius":20}`))
+	_, err := decodeMessage([]byte(`{"type":"temperature","format":"json_v4.0","celsius":20}`))
 	if err == nil {
 		t.Fatal("unsupported protocol major accepted")
 	}
@@ -136,7 +145,7 @@ func TestDecodeRejectsUnsupportedProtocolMajor(t *testing.T) {
 func TestDecodeKnownReportRequiresCompleteShape(t *testing.T) {
 	t.Parallel()
 
-	_, _, _, err := decodeMessage([]byte(`{"type":"velocity","format":"json_v3.3"}`))
+	_, err := decodeMessage([]byte(`{"type":"velocity","format":"json_v3.3"}`))
 	if err == nil {
 		t.Fatal("incomplete velocity report accepted")
 	}

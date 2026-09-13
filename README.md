@@ -21,7 +21,8 @@ The package connects to the configured DVL TCP endpoint on port `16171` and
 supports:
 
 - newline-delimited `velocity`, `velocity_water`, and `position_local` reports;
-- a receive-only report stream with explicit dropped-report counts when a consumer falls behind;
+- separate receive-only streams for velocity, dead-reckoning, and unknown reports,
+  with per-stream dropped-report counts when a consumer falls behind;
 - complete timing, covariance, validity, status, and per-transducer fields;
 - typed device identity and configuration commands;
 - interleaved report and command-response handling;

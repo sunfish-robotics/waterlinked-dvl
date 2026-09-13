@@ -5,21 +5,12 @@ import (
 	"time"
 )
 
-// Report is a typed message from the DVL report stream.
-//
-// The package owns the set of report implementations. Callers should use a
-// type switch and handle UnknownReport so newer protocol messages do not need
-// to terminate an otherwise compatible connection.
-type Report interface {
-	report()
-}
+// Sample is one report delivered on a typed report stream.
+type Sample[T any] struct {
+	Report T
 
-// Sample is one report delivered to a consumer.
-type Sample struct {
-	Report Report
-
-	// DroppedBefore is the number of older reports discarded since the previous
-	// delivered sample because the consumer did not keep up.
+	// DroppedBefore is the number of older reports from the same stream discarded
+	// since the previous delivered sample because the consumer did not keep up.
 	DroppedBefore uint64
 }
 
@@ -121,8 +112,6 @@ type VelocityReport struct {
 	ProtocolVersion ProtocolVersion
 }
 
-func (*VelocityReport) report() {}
-
 // DeadReckoningStatus is the raw status value on a position_local report.
 type DeadReckoningStatus uint8
 
@@ -146,8 +135,6 @@ type DeadReckoningReport struct {
 	ProtocolVersion ProtocolVersion
 }
 
-func (*DeadReckoningReport) report() {}
-
 // UnknownReport preserves a well-formed report type unknown to this version of
 // the package. Raw is an owned copy of the complete JSON object.
 type UnknownReport struct {
@@ -155,5 +142,3 @@ type UnknownReport struct {
 	ProtocolVersion ProtocolVersion
 	Raw             json.RawMessage
 }
-
-func (*UnknownReport) report() {}

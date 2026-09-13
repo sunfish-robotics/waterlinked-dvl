@@ -38,11 +38,12 @@ type Conn struct {
 type connState struct {
 	socket net.Conn
 
-	reports     chan Sample
-	reportInput chan Report
-	commands    chan commandRequest
-	done        chan struct{}
-	workers     sync.WaitGroup
+	velocity      reportStream[*VelocityReport]
+	deadReckoning reportStream[*DeadReckoningReport]
+	unknown       reportStream[*UnknownReport]
+	commands      chan commandRequest
+	done          chan struct{}
+	workers       sync.WaitGroup
 
 	terminalOnce sync.Once
 	errMu        sync.RWMutex
@@ -87,45 +88,60 @@ func Dial(ctx context.Context, address string) (*Conn, error) {
 	}
 
 	state := &connState{
-		socket:      socket,
-		reports:     make(chan Sample),
-		reportInput: make(chan Report),
-		commands:    make(chan commandRequest),
-		done:        make(chan struct{}),
+		socket:        socket,
+		velocity:      newReportStream[*VelocityReport](),
+		deadReckoning: newReportStream[*DeadReckoningReport](),
+		unknown:       newReportStream[*UnknownReport](),
+		commands:      make(chan commandRequest),
+		done:          make(chan struct{}),
 	}
 	conn := &Conn{state: state}
 
-	state.workers.Add(3)
-	go func() {
-		defer state.workers.Done()
-		state.runReportBroker()
-	}()
-	go func() {
-		defer state.workers.Done()
-		state.runCommands()
-	}()
-	go func() {
-		defer state.workers.Done()
-		state.readMessages()
-	}()
+	start := func(worker func()) {
+		state.workers.Add(1)
+		go func() {
+			defer state.workers.Done()
+			worker()
+		}()
+	}
+	start(func() { state.velocity.run(state.done) })
+	start(func() { state.deadReckoning.run(state.done) })
+	start(func() { state.unknown.run(state.done) })
+	start(state.runCommands)
+	start(state.readMessages)
 
 	return conn, nil
 }
 
-// Reports returns the connection's report stream. Repeated calls return the
-// same channel; multiple receivers divide the stream rather than broadcasting
-// it.
+// VelocityReports returns bottom- and water-relative velocity reports. Repeated
+// calls return the same channel; multiple receivers divide the stream rather
+// than broadcasting it.
 //
 // Reports are delivered through a bounded, drop-oldest queue so a slow or
-// absent consumer cannot prevent command responses from being read. Each
-// Sample reports any resulting loss. The channel closes when the connection
-// ends, and buffered reports from that connection epoch are discarded.
-func (c *Conn) Reports() <-chan Sample {
-	return c.state.reports
+// absent consumer cannot prevent command responses or other report types from
+// being read. Each Sample reports velocity-stream loss. The channel closes when
+// the connection ends, and buffered reports from that connection epoch are
+// discarded.
+func (c *Conn) VelocityReports() <-chan Sample[*VelocityReport] {
+	return c.state.velocity.output
+}
+
+// DeadReckoningReports returns local position and orientation reports. Its
+// buffering and receiver semantics match VelocityReports, with independent
+// loss accounting.
+func (c *Conn) DeadReckoningReports() <-chan Sample[*DeadReckoningReport] {
+	return c.state.deadReckoning.output
+}
+
+// UnknownReports returns well-formed report types unknown to this version of
+// the package. Its buffering and receiver semantics match VelocityReports, with
+// independent loss accounting.
+func (c *Conn) UnknownReports() <-chan Sample[*UnknownReport] {
+	return c.state.unknown.output
 }
 
 // Done is closed when the connection ends. It is a broadcast lifecycle signal
-// for supervisors and callers that do not consume Reports.
+// for supervisors and callers that do not consume report streams.
 func (c *Conn) Done() <-chan struct{} {
 	return c.state.done
 }
@@ -203,10 +219,10 @@ func (c *Conn) CalibrateGyro(ctx context.Context) error {
 }
 
 // Close terminates the connection and unblocks pending operations. It is safe
-// to call Close more than once. When Close returns, Reports is closed and the
-// connection owns no running goroutines. Operations interrupted by Close
-// return errors comparable with net.ErrClosed; unexpected transport failures
-// retain their underlying EOF or network error.
+// to call Close more than once. When Close returns, every report stream is
+// closed and the connection owns no running goroutines. Operations interrupted
+// by Close return errors comparable with net.ErrClosed; unexpected transport
+// failures retain their underlying EOF or network error.
 func (c *Conn) Close() error {
 	c.state.terminate(net.ErrClosed)
 	c.state.workers.Wait()
@@ -394,28 +410,47 @@ func (s *connState) readMessages() {
 			continue
 		}
 
-		report, response, messageType, err := decodeMessage(frame)
+		message, err := decodeMessage(frame)
 		if err != nil {
 			s.terminate(&ProtocolError{
 				Operation:   "decode message",
-				MessageType: messageType,
+				MessageType: message.messageType,
 				Err:         err,
 			})
 			return
 		}
 
-		if response != nil {
-			if !s.deliverResponse(*response) {
+		if message.response != nil {
+			if !s.deliverResponse(*message.response) {
+				return
+			}
+			continue
+		}
+		if message.velocity != nil {
+			if !s.velocity.publish(s.done, message.velocity) {
+				return
+			}
+			continue
+		}
+		if message.deadReckoning != nil {
+			if !s.deadReckoning.publish(s.done, message.deadReckoning) {
+				return
+			}
+			continue
+		}
+		if message.unknown != nil {
+			if !s.unknown.publish(s.done, message.unknown) {
 				return
 			}
 			continue
 		}
 
-		select {
-		case s.reportInput <- report:
-		case <-s.done:
-			return
-		}
+		s.terminate(&ProtocolError{
+			Operation:   "decode message",
+			MessageType: message.messageType,
+			Err:         errors.New("decoded message has no payload"),
+		})
+		return
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -466,49 +501,6 @@ func (s *connState) deliverResponse(response commandResponse) bool {
 		return true
 	case <-s.done:
 		return false
-	}
-}
-
-func (s *connState) runReportBroker() {
-	defer close(s.reports)
-
-	queue := make([]Report, reportBufferCapacity)
-	head := 0
-	size := 0
-	var dropped uint64
-
-	for {
-		select {
-		case <-s.done:
-			return
-		default:
-		}
-
-		var output chan Sample
-		var sample Sample
-		if size != 0 {
-			output = s.reports
-			sample = Sample{Report: queue[head], DroppedBefore: dropped}
-		}
-
-		select {
-		case <-s.done:
-			return
-		case report := <-s.reportInput:
-			if size == len(queue) {
-				queue[head] = nil
-				head = (head + 1) % len(queue)
-				size--
-				dropped++
-			}
-			queue[(head+size)%len(queue)] = report
-			size++
-		case output <- sample:
-			queue[head] = nil
-			head = (head + 1) % len(queue)
-			size--
-			dropped = 0
-		}
 	}
 }
 

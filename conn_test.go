@@ -41,9 +41,9 @@ func TestConnDemultiplexesReportAndCommandResponse(t *testing.T) {
 	}
 
 	select {
-	case sample := <-conn.Reports():
-		if _, ok := sample.Report.(*VelocityReport); !ok {
-			t.Fatalf("report type = %T", sample.Report)
+	case sample := <-conn.VelocityReports():
+		if sample.Report == nil {
+			t.Fatal("velocity report is nil")
 		}
 		if sample.DroppedBefore != 0 {
 			t.Fatalf("dropped = %d", sample.DroppedBefore)
@@ -56,13 +56,23 @@ func TestConnDemultiplexesReportAndCommandResponse(t *testing.T) {
 	peer.wait(t)
 }
 
-func TestSlowReportConsumerDoesNotBlockCommands(t *testing.T) {
+func TestSlowVelocityConsumerDoesNotBlockOtherStreamsOrCommands(t *testing.T) {
 	release := make(chan struct{})
 	peer := startTestPeer(t, func(socket net.Conn) error {
 		for index := range reportBufferCapacity + 6 {
 			if err := writeTestFrame(socket, velocityFrame(float64(index))); err != nil {
 				return err
 			}
+		}
+		if err := writeTestFrame(socket, deadReckoningFrame()); err != nil {
+			return err
+		}
+		if err := writeTestFrame(socket, map[string]any{
+			"type":   "temperature",
+			"format": ProtocolJSONV3_3,
+			"value":  20,
+		}); err != nil {
+			return err
 		}
 
 		command, err := readTestCommand(socket)
@@ -87,11 +97,28 @@ func TestSlowReportConsumerDoesNotBlockCommands(t *testing.T) {
 	}
 
 	select {
-	case sample := <-conn.Reports():
+	case sample := <-conn.DeadReckoningReports():
+		if sample.Report == nil || sample.DroppedBefore != 0 {
+			t.Fatalf("dead-reckoning sample = %#v", sample)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for dead-reckoning report")
+	}
+	select {
+	case sample := <-conn.UnknownReports():
+		if sample.Report == nil || sample.Report.Type != "temperature" || sample.DroppedBefore != 0 {
+			t.Fatalf("unknown sample = %#v", sample)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for unknown report")
+	}
+
+	select {
+	case sample := <-conn.VelocityReports():
 		if sample.DroppedBefore != 6 {
 			t.Fatalf("dropped = %d, want 6", sample.DroppedBefore)
 		}
-		report := sample.Report.(*VelocityReport)
+		report := sample.Report
 		if report.Interval != 6*time.Millisecond {
 			t.Fatalf("first retained interval = %s, want 6ms", report.Interval)
 		}
@@ -281,14 +308,9 @@ func TestPeerClosurePublishesEOF(t *testing.T) {
 	if !errors.Is(conn.Err(), io.EOF) {
 		t.Fatalf("Err = %v", conn.Err())
 	}
-	select {
-	case _, ok := <-conn.Reports():
-		if ok {
-			t.Fatal("Reports remained open")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Reports did not close")
-	}
+	waitForClosed(t, "velocity reports", conn.VelocityReports())
+	waitForClosed(t, "dead-reckoning reports", conn.DeadReckoningReports())
+	waitForClosed(t, "unknown reports", conn.UnknownReports())
 }
 
 func TestCloseIsIdempotentAndPublishesNetErrClosed(t *testing.T) {
@@ -311,9 +333,9 @@ func TestCloseIsIdempotentAndPublishesNetErrClosed(t *testing.T) {
 	if _, err := conn.Info(t.Context()); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Info after Close = %v", err)
 	}
-	if _, ok := <-conn.Reports(); ok {
-		t.Fatal("Reports remained open after Close returned")
-	}
+	assertClosed(t, "velocity reports", conn.VelocityReports())
+	assertClosed(t, "dead-reckoning reports", conn.DeadReckoningReports())
+	assertClosed(t, "unknown reports", conn.UnknownReports())
 	peer.wait(t)
 }
 
@@ -358,6 +380,30 @@ func TestUnexpectedResponseEndsConnectionWithoutBlockingLaterCommands(t *testing
 	defer cancel()
 	if _, err := conn.Info(ctx); !errors.Is(err, conn.Err()) {
 		t.Fatalf("Info after unexpected response = %v, want %v", err, conn.Err())
+	}
+}
+
+func waitForClosed[T any](t *testing.T, name string, stream <-chan T) {
+	t.Helper()
+	select {
+	case _, ok := <-stream:
+		if ok {
+			t.Fatalf("%s remained open", name)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("%s did not close", name)
+	}
+}
+
+func assertClosed[T any](t *testing.T, name string, stream <-chan T) {
+	t.Helper()
+	select {
+	case _, ok := <-stream:
+		if ok {
+			t.Fatalf("%s remained open", name)
+		}
+	default:
+		t.Fatalf("%s was not closed when Close returned", name)
 	}
 }
 
@@ -463,6 +509,22 @@ func velocityFrame(milliseconds float64) map[string]any {
 		"type":                 "velocity",
 		"time_of_validity":     1789228180928221,
 		"time_of_transmission": 1789228181074924,
+	}
+}
+
+func deadReckoningFrame() map[string]any {
+	return map[string]any{
+		"ts":     1789228180.928221,
+		"x":      12.4,
+		"y":      64.6,
+		"z":      1.7,
+		"std":    0.002,
+		"roll":   0.6,
+		"pitch":  0.7,
+		"yaw":    90.1,
+		"type":   "position_local",
+		"status": 0,
+		"format": ProtocolJSONV3_3,
 	}
 }
 

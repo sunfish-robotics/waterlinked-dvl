@@ -23,6 +23,14 @@ type commandResponse struct {
 	Format       ProtocolVersion
 }
 
+type decodedMessage struct {
+	messageType   string
+	response      *commandResponse
+	velocity      *VelocityReport
+	deadReckoning *DeadReckoningReport
+	unknown       *UnknownReport
+}
+
 type messageHeader struct {
 	Type   string          `json:"type"`
 	Format ProtocolVersion `json:"format"`
@@ -95,35 +103,40 @@ type configWire struct {
 	PeriodicCyclingEnabled *bool    `json:"periodic_cycling_enabled"`
 }
 
-func decodeMessage(data []byte) (Report, *commandResponse, string, error) {
+func decodeMessage(data []byte) (decodedMessage, error) {
 	var header messageHeader
 	if err := json.Unmarshal(data, &header); err != nil {
-		return nil, nil, "", err
+		return decodedMessage{}, err
 	}
+	message := decodedMessage{messageType: header.Type}
 	if header.Type == "" {
-		return nil, nil, "", errors.New("missing type")
+		return message, errors.New("missing type")
 	}
 	if !supportedProtocolVersion(header.Format) {
-		return nil, nil, header.Type, fmt.Errorf("unsupported format %q", header.Format)
+		return message, fmt.Errorf("unsupported format %q", header.Format)
 	}
 
 	switch header.Type {
 	case "velocity", "velocity_water":
-		report, err := decodeVelocityReport(data)
-		return report, nil, header.Type, err
+		var err error
+		message.velocity, err = decodeVelocityReport(data)
+		return message, err
 	case "position_local":
-		report, err := decodeDeadReckoningReport(data)
-		return report, nil, header.Type, err
+		var err error
+		message.deadReckoning, err = decodeDeadReckoningReport(data)
+		return message, err
 	case "response":
 		response, err := decodeResponse(data)
-		return nil, &response, header.Type, err
+		message.response = &response
+		return message, err
 	default:
 		raw := append(json.RawMessage(nil), data...)
-		return &UnknownReport{
+		message.unknown = &UnknownReport{
 			Type:            header.Type,
 			ProtocolVersion: header.Format,
 			Raw:             raw,
-		}, nil, header.Type, nil
+		}
+		return message, nil
 	}
 }
 

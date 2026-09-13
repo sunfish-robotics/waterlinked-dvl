@@ -12,37 +12,27 @@ import (
 var (
 	_ io.Closer                                        = (*dvl.Conn)(nil)
 	_ func(context.Context, string) (*dvl.Conn, error) = dvl.Dial
-	_ dvl.Report                                       = (*dvl.VelocityReport)(nil)
-	_ dvl.Report                                       = (*dvl.DeadReckoningReport)(nil)
-	_ dvl.Report                                       = (*dvl.UnknownReport)(nil)
 	_ interface {
-		Reports() <-chan dvl.Sample
+		VelocityReports() <-chan dvl.Sample[*dvl.VelocityReport]
+		DeadReckoningReports() <-chan dvl.Sample[*dvl.DeadReckoningReport]
+		UnknownReports() <-chan dvl.Sample[*dvl.UnknownReport]
 		Done() <-chan struct{}
 		Err() error
 	} = (*dvl.Conn)(nil)
 )
 
-// These compile-only consumers exercise the proposed API from outside the
-// package. Behaviour belongs to the protocol implementation tests.
+// These compile-only consumers exercise the API from outside the package.
 func readVelocity(ctx context.Context, conn *dvl.Conn) (dvl.Vector3, error) {
 	for {
 		select {
 		case <-ctx.Done():
 			return dvl.Vector3{}, ctx.Err()
-		case sample, ok := <-conn.Reports():
+		case sample, ok := <-conn.VelocityReports():
 			if !ok {
 				return dvl.Vector3{}, conn.Err()
 			}
-
-			switch report := sample.Report.(type) {
-			case *dvl.VelocityReport:
-				if report.Valid {
-					return report.Velocity, nil
-				}
-			case *dvl.DeadReckoningReport:
-				continue
-			case *dvl.UnknownReport:
-				continue
+			if sample.Report.Valid {
+				return sample.Report.Velocity, nil
 			}
 		}
 	}
