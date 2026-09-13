@@ -57,8 +57,11 @@ func ExampleConn_UnhandledFrames() {
 	for sample := range conn.UnhandledFrames() {
 		frame := sample.Report
 		if frame.Err != nil {
-			// A malformed report, an unknown protocol major, or an unsolicited or
-			// unreadable command response: Err explains why it could not be decoded.
+			// A malformed report, an unknown protocol major, or a response with no
+			// command currently waiting for it (unsolicited, or late for one that
+			// already finished): Err explains why it could not be decoded. A
+			// response tied to a still-waiting command that cannot be decoded fails
+			// that command's own call instead of arriving here.
 			log.Printf("undecodable %q frame: %v", frame.Type, frame.Err)
 			continue
 		}

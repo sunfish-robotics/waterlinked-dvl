@@ -29,10 +29,13 @@ demultiplexes every frame it reads onto one of three independent, receive-only
 streams: `VelocityReports` for `velocity` and `velocity_water` reports,
 `DeadReckoningReports` for `position_local` reports, and `UnhandledFrames` for
 everything else the package cannot turn into one of those — a malformed
-report, a report of an unknown type, or an unsolicited or unreadable command
-response. Each stream is a bounded, drop-oldest queue with its own loss
-counter, so a slow or absent consumer on one stream can never block another
-stream or a pending command.
+report, a report of an unknown type, or a response with no command currently
+waiting for it, such as an unsolicited response or a late one for a command
+that already finished. A response that arrives while its command is still
+waiting, but cannot be decoded, instead fails that command's own call and
+never reaches this stream. Each stream is a bounded, drop-oldest queue with
+its own loss counter, so a slow or absent consumer on one stream can never
+block another stream or a pending command.
 
 A velocity report's status, transducer readings, and timing are always
 populated. `VelocityReport.Measurement` is populated only while the DVL has a
@@ -47,13 +50,13 @@ same connection.
 
 ## Frame policy
 
-A connection ends only on a transport error or EOF, a frame over the size cap,
-a failed command write, a command whose response has not arrived within the
-command timeout, no data within the idle timeout when one is set, or a
-response naming a command other than the one in flight. Every other frame the
-package cannot decode is published on `UnhandledFrames` instead, and a
-response the caller cannot use fails only that one command; the connection and
-every other stream carry on.
+Besides Close, a connection ends only on a transport error or EOF, a frame
+over the size cap, a failed command write, a command whose response has not
+arrived within the command timeout, no data within the idle timeout when one
+is set, or a response naming a command other than the one in flight. Every
+other frame the package cannot decode is published on `UnhandledFrames`
+instead, and a response the caller cannot use fails only that one command; the
+connection and every other stream carry on.
 
 ## Connecting
 
