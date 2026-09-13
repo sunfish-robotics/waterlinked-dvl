@@ -155,7 +155,7 @@ func verifyConfigUpdate(update dvl.ConfigUpdate, actual dvl.Config) error {
 func runWatch(ctx context.Context, args []string, output commandIO) error {
 	flags := newCommandFlags(
 		"waterlinked-dvl watch",
-		"Stream velocity, dead-reckoning, and unknown reports until interrupted.",
+		"Print delivered velocity and dead-reckoning reports plus unhandled frames until interrupted.",
 		output,
 	)
 	duration := flags.set.Duration("duration", 0, "stop after this duration; zero waits until interrupted")

@@ -166,7 +166,7 @@ Commands:
   info                    Show device identity, firmware, and readiness
   config get              Show the complete device configuration
   config set              Apply and verify selected configuration fields
-  watch                   Stream typed reports until interrupted
+  watch                   Print delivered reports and unhandled frames
   reset-dead-reckoning    Reset the local dead-reckoning frame
   calibrate-gyro          Calibrate the gyroscope while the DVL is stationary
 

@@ -40,9 +40,10 @@ waterlinked-dvl info -address 192.168.194.95
 waterlinked-dvl watch -address 192.168.194.95
 ```
 
-`info` prints the device identity and firmware. `watch` prints every report
-as it arrives, so you can see the DVL acquire and lose lock. Once that works,
-the same thing in Go:
+`info` prints the device identity and firmware. `watch` prints delivered
+velocity and dead-reckoning reports plus unhandled frames, with a dropped-item
+count for each stream, so you can see the DVL acquire and lose lock. Once that
+works, the same thing in Go:
 
 ```go
 package main

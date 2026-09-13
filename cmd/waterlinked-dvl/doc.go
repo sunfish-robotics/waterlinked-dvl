@@ -18,9 +18,10 @@
 //
 //	waterlinked-dvl info -address 192.168.194.95
 //
-// watch prints velocity, dead-reckoning, and unhandled reports as they
-// arrive, one per line, until interrupted or until -duration elapses. With
-// -json each line is one JSON object, so a capture can be replayed later:
+// watch prints delivered velocity and dead-reckoning reports plus unhandled
+// frames, one per line, until interrupted or until -duration elapses. Each line
+// includes the number of older items dropped from that stream. With -json each
+// line is one JSON object, so a capture can be replayed later:
 //
 //	waterlinked-dvl watch -duration 30s -json > reports.jsonl
 //
