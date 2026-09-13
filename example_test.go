@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 
 	dvl "github.com/sunfish-robotics/waterlinked-dvl"
 )
@@ -40,6 +41,72 @@ func ExampleConn_VelocityReports() {
 
 	if err := conn.Err(); err != nil && !errors.Is(err, net.ErrClosed) {
 		log.Printf("DVL connection ended: %v", err)
+	}
+}
+
+func ExampleConn_UnhandledFrames() {
+	ctx := context.Background()
+	address := fmt.Sprintf("192.168.194.95:%d", dvl.DefaultPort)
+
+	conn, err := dvl.Dial(ctx, address)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	for sample := range conn.UnhandledFrames() {
+		frame := sample.Report
+		if frame.Err != nil {
+			// A malformed report, an unknown protocol major, or an unsolicited or
+			// unreadable command response: Err explains why it could not be decoded.
+			log.Printf("undecodable %q frame: %v", frame.Type, frame.Err)
+			continue
+		}
+		// A well-formed report of a type this version of the package does not
+		// model yet.
+		log.Printf("unknown report type %q: %s", frame.Type, frame.Raw)
+	}
+}
+
+func ExampleDialer() {
+	ctx := context.Background()
+	address := fmt.Sprintf("192.168.194.95:%d", dvl.DefaultPort)
+	dialer := &dvl.Dialer{
+		IdleTimeout: 5 * time.Second,
+	}
+
+	// runEpoch consumes one connection until it ends, reporting why.
+	runEpoch := func() error {
+		conn, err := dialer.Dial(ctx, address)
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+
+		velocityReports := conn.VelocityReports()
+		for {
+			select {
+			case sample, ok := <-velocityReports:
+				if !ok {
+					velocityReports = nil
+					continue
+				}
+				if sample.Report.Measurement != nil {
+					log.Printf("velocity: %+v", sample.Report.Measurement.Velocity)
+				}
+			case <-conn.Done():
+				return conn.Err()
+			}
+		}
+	}
+
+	// A supervisor loop: redial whenever the connection ends, including when
+	// the idle timeout fires because the device has gone quiet.
+	for {
+		if err := runEpoch(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Printf("DVL connection ended, redialing: %v", err)
+		}
+		time.Sleep(time.Second)
 	}
 }
 

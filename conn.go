@@ -35,13 +35,13 @@ var errNilContext = errors.New("dvl: nil context")
 // transmission, its response is retired before the next command begins so
 // correlation remains unambiguous.
 //
-// A connection ends on Close, on a transport failure or EOF, on a frame longer
-// than the protocol's size cap, on a failed command write, on the dialer's idle
-// timeout elapsing with no complete frame, on a command the device leaves
-// unanswered for the dialer's command timeout, and on a response that names a
-// command other than the one in flight. An unanswered command ends the
-// connection because a response that arrives after the wait could no longer be
-// told apart from the response to the command after it. Everything else the
+// Besides an explicit Close, a connection ends on: a transport error or EOF; a
+// frame over the size cap; a failed command write; a command whose response
+// has not arrived within the dialer's command timeout; no data within the
+// dialer's idle timeout, when one is set; or a response naming a command other
+// than the one in flight. A command left unanswered ends the connection
+// because a response that arrives after the wait could no longer be told
+// apart from the response to the command issued after it. Everything else the
 // device sends that the package cannot decode is reported on UnhandledFrames
 // instead.
 type Conn struct {
@@ -101,17 +101,20 @@ type Dialer struct {
 	// which enables the operating system's TCP keep-alive with Go's defaults.
 	NetDialer *net.Dialer
 
-	// IdleTimeout ends the connection when no complete frame has arrived for
-	// this long. The terminal error wraps the underlying deadline error, so
+	// IdleTimeout bounds the wait for the next complete frame: the deadline is
+	// set once, when the wait begins, and is not extended by bytes that arrive
+	// without completing a frame, so a peer trickling partial data can still
+	// exceed it. The terminal error wraps the underlying deadline error, so
 	// errors.Is(err, os.ErrDeadlineExceeded) reports true. Zero disables the
 	// check. A device with acoustics disabled may legitimately send nothing,
 	// so choose a value with that in mind.
 	IdleTimeout time.Duration
 
 	// CommandTimeout bounds how long a command waits for the device's
-	// response. When it expires the connection ends with a *ProtocolError
-	// wrapping context.DeadlineExceeded, because a response arriving later
-	// could be matched to the wrong command. Zero uses 30 seconds.
+	// response. When a command's response has not arrived within this bound,
+	// the connection ends with a *ProtocolError wrapping
+	// context.DeadlineExceeded, because a response arriving later could be
+	// matched to the wrong command. Zero uses 30 seconds.
 	CommandTimeout time.Duration
 
 	// ReportBuffer is the number of reports each typed stream retains for a
