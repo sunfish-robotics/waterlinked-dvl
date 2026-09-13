@@ -25,8 +25,9 @@ supports:
   frames, with per-stream dropped-report counts when a consumer falls behind;
 - undecodable frames — malformed reports, unknown report types, unsolicited or
   unreadable responses — reported on the unhandled stream rather than ending the
-  connection, which now happens only on a transport failure, a frame that
-  exceeds the size cap, or a response that cannot be correlated with the command
+  connection. A connection now ends only on a transport failure or EOF, a frame
+  longer than the size cap, a failed command write, a command the device leaves
+  unanswered for 30 seconds, or a response naming a command other than the one
   in flight;
 - complete timing, covariance, validity, status, and per-transducer fields;
 - typed device identity and configuration commands;

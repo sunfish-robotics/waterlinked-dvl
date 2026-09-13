@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -290,11 +291,7 @@ func TestUndecodableResponseFailsOnlyThePendingCommand(t *testing.T) {
 	}
 	assertStillConnected(t, conn)
 
-	select {
-	case sample := <-conn.UnhandledFrames():
-		t.Fatalf("failed response was also published: %#v", sample)
-	default:
-	}
+	assertNoUnhandledFrame(t, conn, "failed response was also published")
 
 	config, err := conn.Config(t.Context())
 	if err != nil {
@@ -423,6 +420,9 @@ func TestUndecodableFrameIsReportedAndConnectionContinues(t *testing.T) {
 		messageType     string
 		protocolVersion ProtocolVersion
 		wantErr         bool
+
+		// errContains is checked when the row names text the contract promises.
+		errContains string
 	}{
 		{
 			name:    "not a JSON object",
@@ -434,6 +434,7 @@ func TestUndecodableFrameIsReportedAndConnectionContinues(t *testing.T) {
 			frame:           `{"format":"json_v3.3","vx":0.1}`,
 			protocolVersion: ProtocolJSONV3_3,
 			wantErr:         true,
+			errContains:     "missing type",
 		},
 		{
 			name:        "report without format",
@@ -447,6 +448,7 @@ func TestUndecodableFrameIsReportedAndConnectionContinues(t *testing.T) {
 			messageType:     "temperature",
 			protocolVersion: "json_v4.0",
 			wantErr:         true,
+			errContains:     `unsupported format "json_v4.0"`,
 		},
 		{
 			name:            "well-formed report of unmodelled type",
@@ -488,6 +490,7 @@ func TestUndecodableFrameIsReportedAndConnectionContinues(t *testing.T) {
 			messageType:     "response",
 			protocolVersion: ProtocolJSONV3_3,
 			wantErr:         true,
+			errContains:     `unsolicited response to "get_config"`,
 		},
 	}
 
@@ -532,6 +535,9 @@ func TestUndecodableFrameIsReportedAndConnectionContinues(t *testing.T) {
 				case test.wantErr && protocolErr.Operation != "decode message":
 					t.Fatalf("protocol error = %#v", protocolErr)
 				}
+				if test.errContains != "" && !strings.Contains(frame.Err.Error(), test.errContains) {
+					t.Fatalf("err = %q, want it to mention %q", frame.Err, test.errContains)
+				}
 			case <-time.After(time.Second):
 				t.Fatal("timed out waiting for unhandled frame")
 			}
@@ -571,13 +577,7 @@ func TestBlankFramesAreSkippedSilently(t *testing.T) {
 	conn := dialTestPeer(t, peer.address)
 	assertVelocityAndCommandStillWork(t, conn)
 
-	// The blanks preceded the velocity report on the wire, so anything they
-	// published would already be queued.
-	select {
-	case sample := <-conn.UnhandledFrames():
-		t.Fatalf("blank frame was reported: %#v", sample)
-	default:
-	}
+	assertNoUnhandledFrame(t, conn, "blank frame was reported")
 	assertStillConnected(t, conn)
 
 	close(release)
@@ -633,6 +633,18 @@ func TestOversizedFrameEndsConnection(t *testing.T) {
 		t.Fatalf("Err = %v, want bufio.ErrTooLong", conn.Err())
 	}
 	peer.wait(t)
+}
+
+// assertNoUnhandledFrame waits long enough for the reader to have handed a
+// frame to the unhandled broker and for the broker to offer it, so the absence
+// it asserts is not just the absence of a queued value.
+func assertNoUnhandledFrame(t *testing.T, conn *Conn, reason string) {
+	t.Helper()
+	select {
+	case sample := <-conn.UnhandledFrames():
+		t.Fatalf("%s: %#v", reason, sample)
+	case <-time.After(100 * time.Millisecond):
+	}
 }
 
 func assertStillConnected(t *testing.T, conn *Conn) {

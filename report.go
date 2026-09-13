@@ -15,8 +15,9 @@ type Sample[T any] struct {
 }
 
 // ProtocolVersion is the format identifier carried by a device message. The
-// client accepts the backwards-compatible json_v3 family and rejects other
-// major versions with ProtocolError.
+// client decodes the backwards-compatible json_v3 family; a report in another
+// major version is reported on Conn.UnhandledFrames with a *ProtocolError
+// rather than decoded. Responses are decoded whatever format they claim.
 type ProtocolVersion string
 
 const (

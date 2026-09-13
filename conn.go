@@ -32,6 +32,12 @@ var errNilContext = errors.New("dvl: nil context")
 // called concurrently with any operation. If a command is cancelled after
 // transmission, its response is retired before the next command begins so
 // correlation remains unambiguous.
+//
+// A connection ends on Close, on a transport failure or EOF, on a frame longer
+// than the protocol's size cap, on a failed command write, on a command the
+// device leaves unanswered for 30 seconds, and on a response that names a
+// command other than the one in flight. Everything else the device sends that
+// the package cannot decode is reported on UnhandledFrames instead.
 type Conn struct {
 	state *connState
 }
@@ -71,10 +77,11 @@ type pendingCommand struct {
 	name string
 
 	// outcome carries either the correlated response or the decoding error that
-	// stopped the reader from producing one.
+	// stopped the reader from producing one. The reader fills it at most once:
+	// it blocks on processed afterwards, and finishCommand retires the slot
+	// before closing that channel.
 	outcome   chan commandResult
 	processed chan struct{}
-	delivered bool
 }
 
 // Dial connects to address, which must include a TCP port.
@@ -176,7 +183,9 @@ func (c *Conn) Info(ctx context.Context) (DeviceInfo, error) {
 	return info, nil
 }
 
-// Config returns the complete configuration reported by the device.
+// Config returns the complete configuration reported by the device. Values are
+// not validated on the way in: the device is the authority on its own state, so
+// Config can report a value UpdateConfig would refuse to send.
 func (c *Conn) Config(ctx context.Context) (Config, error) {
 	var config Config
 	_, err := c.command(ctx, "get_config", nil, func(response commandResponse) error {
@@ -192,9 +201,11 @@ func (c *Conn) Config(ctx context.Context) (Config, error) {
 
 // UpdateConfig applies the non-nil fields in update.
 //
-// The complete update is validated before anything is written. A successful
-// response means the device accepted the command; callers that need verified
-// application should read Config again and compare it with their desired state.
+// The complete update is validated before anything is written, so a
+// read-modify-write round trip can fail here on a value Config reported
+// unchanged. A successful response means the device accepted the command;
+// callers that need verified application should read Config again and compare
+// it with their desired state.
 func (c *Conn) UpdateConfig(ctx context.Context, update ConfigUpdate) error {
 	parameters, err := encodeConfigUpdate(update)
 	if err != nil {
@@ -441,6 +452,16 @@ func (s *connState) readMessages() {
 			if !s.reportUnhandled(*message.unhandled) {
 				return
 			}
+		default:
+			// Unreachable while decodeMessage sets exactly one payload, which
+			// FuzzDecodeMessage guards. If that ever regresses, stop loudly
+			// rather than dropping frames on the floor.
+			s.terminate(&ProtocolError{
+				Operation:   "decode message",
+				MessageType: "",
+				Err:         errors.New("decoded message has no payload"),
+			})
+			return
 		}
 	}
 
@@ -467,11 +488,10 @@ func (s *connState) reportUnhandled(frame UnhandledFrame) bool {
 func (s *connState) failPendingCommand(err error) bool {
 	s.pendingMu.Lock()
 	pending := s.pending
-	if pending == nil || pending.delivered {
+	if pending == nil {
 		s.pendingMu.Unlock()
 		return false
 	}
-	pending.delivered = true
 	outcome := pending.outcome
 	s.pendingMu.Unlock()
 
@@ -485,10 +505,11 @@ func (s *connState) failPendingCommand(err error) bool {
 }
 
 // deliverResponse routes response to the command awaiting it. A response that
-// arrives with no command pending is reported as an unhandled frame; one that
-// names a different command, or a second response to a command still in flight,
-// makes correlation ambiguous and ends the connection. It reports false when
-// the reader must stop.
+// names a command other than the one in flight makes correlation ambiguous and
+// ends the connection; one that arrives with no command pending is reported as
+// an unhandled frame, which is also what a late second response to an
+// already-retired command looks like. It reports false when the reader must
+// stop.
 func (s *connState) deliverResponse(frame []byte, response commandResponse) bool {
 	s.pendingMu.Lock()
 	pending := s.pending
@@ -511,16 +532,6 @@ func (s *connState) deliverResponse(frame []byte, response commandResponse) bool
 		})
 		return false
 	}
-	if pending.delivered {
-		s.pendingMu.Unlock()
-		s.terminate(&ProtocolError{
-			Operation:   "correlate response",
-			MessageType: response.ResponseTo,
-			Err:         errors.New("duplicate response"),
-		})
-		return false
-	}
-	pending.delivered = true
 	outcome := pending.outcome
 	s.pendingMu.Unlock()
 
