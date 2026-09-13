@@ -5,11 +5,11 @@ import (
 	"time"
 )
 
-// Sample is one report delivered on a typed report stream.
+// Sample is one item delivered on a typed stream.
 type Sample[T any] struct {
 	Report T
 
-	// DroppedBefore is the number of older reports from the same stream discarded
+	// DroppedBefore is the number of older items from the same stream discarded
 	// since the previous delivered sample because the consumer did not keep up.
 	DroppedBefore uint64
 }
@@ -155,7 +155,8 @@ type DeadReckoningReport struct {
 // UnhandledFrame is a frame the connection received but could not turn into a
 // typed report. Err is nil when the frame was a well-formed report of a type
 // this version of the package does not model; otherwise it is a *ProtocolError
-// describing why decoding failed. Raw is an owned copy of the complete frame.
+// describing why decoding failed. Raw is an owned copy of the complete frame;
+// it is not guaranteed to be valid JSON when Err is set.
 type UnhandledFrame struct {
 	// Type is the frame's "type" field, or "" when the frame had none or was
 	// not a JSON object.

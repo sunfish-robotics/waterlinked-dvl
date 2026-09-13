@@ -37,13 +37,15 @@ var errNilContext = errors.New("dvl: nil context")
 //
 // Besides an explicit Close, a connection ends on: a transport error or EOF; a
 // frame over the size cap; a failed command write; a command whose response
-// has not arrived within the dialer's command timeout; no data within the
-// dialer's idle timeout, when one is set; or a response naming a command other
-// than the one in flight. A command left unanswered ends the connection
-// because a response that arrives after the wait could no longer be told
-// apart from the response to the command issued after it. Everything else the
-// device sends that the package cannot decode is reported on UnhandledFrames
-// instead.
+// has not arrived within the dialer's command timeout; no complete frame
+// within the dialer's idle timeout, when one is set; or a response naming a
+// command other than the one in flight. A command left unanswered ends the
+// connection because a response that arrives after the wait could no longer
+// be told apart from the response to the command issued after it. Everything
+// else the device sends that the package cannot decode is reported on
+// UnhandledFrames instead, except a response that arrives while its command
+// is still waiting: an undecodable one fails that command's own call and
+// never reaches this stream.
 type Conn struct {
 	state *connState
 }
@@ -61,8 +63,9 @@ type connState struct {
 	commands      chan commandRequest
 	workers       sync.WaitGroup
 
-	// ctx is cancelled exactly once, when the connection ends.
-	// context.Cause(ctx) is the terminal error.
+	// ctx is cancelled when the connection ends; cancel may be called more
+	// than once, but only the first call sets the cause. context.Cause(ctx)
+	// is the terminal error.
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
@@ -111,14 +114,15 @@ type Dialer struct {
 	IdleTimeout time.Duration
 
 	// CommandTimeout bounds how long a command waits for the device's
-	// response. When a command's response has not arrived within this bound,
-	// the connection ends with a *ProtocolError wrapping
-	// context.DeadlineExceeded, because a response arriving later could be
-	// matched to the wrong command. Zero uses 30 seconds.
+	// response. It also bounds the socket write that sends the command. When
+	// a command's response has not arrived within this bound, the connection
+	// ends with a *ProtocolError wrapping context.DeadlineExceeded, because a
+	// response arriving later could be matched to the wrong command. Zero
+	// uses 30 seconds.
 	CommandTimeout time.Duration
 
-	// ReportBuffer is the number of reports each typed stream retains for a
-	// slow consumer before dropping the oldest. Zero uses 64.
+	// ReportBuffer is the number of items each stream retains for a slow
+	// consumer before dropping the oldest. Zero uses 64.
 	ReportBuffer int
 }
 
@@ -220,9 +224,12 @@ func (c *Conn) DeadReckoningReports() <-chan Sample[DeadReckoningReport] {
 }
 
 // UnhandledFrames returns frames that could not be decoded into a typed
-// report, including well-formed reports of unknown type. Its buffering and
-// receiver semantics match VelocityReports, with independent loss accounting.
-// Receiving from it is optional; an absent consumer never blocks the reader.
+// report, including well-formed reports of unknown type. It does not include
+// a response that arrives while its command is still waiting: an undecodable
+// one instead fails that command's own call and never reaches this stream.
+// Its buffering and receiver semantics match VelocityReports, with
+// independent loss accounting. Receiving from it is optional; an absent
+// consumer never blocks the reader.
 func (c *Conn) UnhandledFrames() <-chan Sample[UnhandledFrame] {
 	return c.state.unhandled.output
 }
@@ -638,8 +645,10 @@ func (s *connState) deliverResponse(frame []byte, response commandResponse) bool
 }
 
 // terminate ends the connection with err as its terminal cause, mapping a nil
-// err to io.EOF. Only the first call sets the cause; later calls leave it
-// unchanged, so terminate is safe to call repeatedly and from any goroutine.
+// err to io.EOF, and closes the socket, which is what unblocks a reader
+// blocked in Scan. Only the first call sets the cause; later calls leave it
+// unchanged but still close the (already closed) socket, so terminate is safe
+// to call repeatedly and from any goroutine.
 func (s *connState) terminate(err error) {
 	if err == nil {
 		err = io.EOF

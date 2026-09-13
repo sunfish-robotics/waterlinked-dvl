@@ -52,9 +52,9 @@ same connection.
 
 Besides Close, a connection ends only on a transport error or EOF, a frame
 over the size cap, a failed command write, a command whose response has not
-arrived within the command timeout, no data within the idle timeout when one
-is set, or a response naming a command other than the one in flight. Every
-other frame the package cannot decode is published on `UnhandledFrames`
+arrived within the command timeout, no complete frame within the idle timeout
+when one is set, or a response naming a command other than the one in flight.
+Every other frame the package cannot decode is published on `UnhandledFrames`
 instead, and a response the caller cannot use fails only that one command; the
 connection and every other stream carry on.
 
