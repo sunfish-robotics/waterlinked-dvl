@@ -92,7 +92,7 @@ func ExampleConn() {
 
 	velocityReports := conn.VelocityReports()
 	deadReckoningReports := conn.DeadReckoningReports()
-	unknownReports := conn.UnknownReports()
+	unhandledFrames := conn.UnhandledFrames()
 	for {
 		select {
 		case sample, ok := <-velocityReports:
@@ -107,12 +107,15 @@ func ExampleConn() {
 				continue
 			}
 			log.Printf("Dead reckoning: %v", sample.Report)
-		case sample, ok := <-unknownReports:
+		case sample, ok := <-unhandledFrames:
 			if !ok {
-				unknownReports = nil
+				unhandledFrames = nil
 				continue
 			}
-			log.Printf("Unknown report: %v", sample.Report)
+			// An unhandled frame is data the client could not model, not a
+			// connection fault: Err is nil for a report type this version of the
+			// package does not know.
+			log.Printf("Unhandled %q frame: %s (%v)", sample.Report.Type, sample.Report.Raw, sample.Report.Err)
 		case <-conn.Done():
 			if err := conn.Err(); err != nil && !errors.Is(err, net.ErrClosed) {
 				log.Printf("DVL connection ended: %v", err)

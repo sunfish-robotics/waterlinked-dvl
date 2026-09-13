@@ -70,7 +70,8 @@ func (s Status) Has(flag Status) bool {
 
 // TransducerReading contains one beam's measurement and diagnostics.
 type TransducerReading struct {
-	// ID is the zero-based protocol identifier, normally in the range 0–3.
+	// ID is the transducer's protocol identifier. Ids are zero-based, and
+	// A50/A125 devices report 0-3.
 	ID uint8
 
 	// Velocity and Distance are measured in metres per second and metres.
@@ -135,10 +136,15 @@ type DeadReckoningReport struct {
 	ProtocolVersion ProtocolVersion
 }
 
-// UnknownReport preserves a well-formed report type unknown to this version of
-// the package. Raw is an owned copy of the complete JSON object.
-type UnknownReport struct {
+// UnhandledFrame is a frame the connection received but could not turn into a
+// typed report. Err is nil when the frame was a well-formed report of a type
+// this version of the package does not model; otherwise it is a *ProtocolError
+// describing why decoding failed. Raw is an owned copy of the complete frame.
+type UnhandledFrame struct {
+	// Type is the frame's "type" field, or "" when the frame had none or was
+	// not a JSON object.
 	Type            string
 	ProtocolVersion ProtocolVersion
 	Raw             json.RawMessage
+	Err             error
 }

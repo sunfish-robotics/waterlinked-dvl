@@ -1,6 +1,8 @@
 package dvl
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -105,12 +107,12 @@ func TestSlowVelocityConsumerDoesNotBlockOtherStreamsOrCommands(t *testing.T) {
 		t.Fatal("timed out waiting for dead-reckoning report")
 	}
 	select {
-	case sample := <-conn.UnknownReports():
-		if sample.Report == nil || sample.Report.Type != "temperature" || sample.DroppedBefore != 0 {
-			t.Fatalf("unknown sample = %#v", sample)
+	case sample := <-conn.UnhandledFrames():
+		if sample.Report.Type != "temperature" || sample.Report.Err != nil || sample.DroppedBefore != 0 {
+			t.Fatalf("unhandled sample = %#v", sample)
 		}
 	case <-ctx.Done():
-		t.Fatal("timed out waiting for unknown report")
+		t.Fatal("timed out waiting for unhandled frame")
 	}
 
 	select {
@@ -207,16 +209,27 @@ func TestCommandRejectionDoesNotEndConnection(t *testing.T) {
 	peer.wait(t)
 }
 
-func TestMalformedCommandResultEndsConnection(t *testing.T) {
+func TestMalformedCommandResultFailsOnlyThatCommand(t *testing.T) {
 	peer := startTestPeer(t, func(socket net.Conn) error {
 		command, err := readTestCommand(socket)
 		if err != nil {
 			return err
 		}
 		if command.Command != "get_config" {
-			return fmt.Errorf("command = %q", command.Command)
+			return fmt.Errorf("first command = %q", command.Command)
 		}
-		return writeTestFrame(socket, successResponse("get_config", map[string]any{}))
+		if err := writeTestFrame(socket, successResponse("get_config", map[string]any{})); err != nil {
+			return err
+		}
+
+		command, err = readTestCommand(socket)
+		if err != nil {
+			return err
+		}
+		if command.Command != "get_version_info" {
+			return fmt.Errorf("second command = %q", command.Command)
+		}
+		return writeTestFrame(socket, infoResponse(true, ""))
 	})
 
 	conn := dialTestPeer(t, peer.address)
@@ -225,9 +238,70 @@ func TestMalformedCommandResultEndsConnection(t *testing.T) {
 	if !errors.As(err, &protocolErr) {
 		t.Fatalf("Config error = %T %v", err, err)
 	}
-	<-conn.Done()
-	if !errors.As(conn.Err(), &protocolErr) {
-		t.Fatalf("terminal error = %T %v", conn.Err(), conn.Err())
+	if protocolErr.Operation != "decode response" || protocolErr.MessageType != "get_config" {
+		t.Fatalf("protocol error = %#v", protocolErr)
+	}
+	assertStillConnected(t, conn)
+
+	info, err := conn.Info(t.Context())
+	if err != nil {
+		t.Fatalf("command after undecodable result: %v", err)
+	}
+	if info.ProductName != "DVL A50" {
+		t.Fatalf("info = %#v", info)
+	}
+	peer.wait(t)
+}
+
+func TestUndecodableResponseFailsOnlyThePendingCommand(t *testing.T) {
+	peer := startTestPeer(t, func(socket net.Conn) error {
+		command, err := readTestCommand(socket)
+		if err != nil {
+			return err
+		}
+		if command.Command != "get_version_info" {
+			return fmt.Errorf("first command = %q", command.Command)
+		}
+		// A response frame the client cannot decode: success is missing.
+		if err := writeTestFrame(socket, json.RawMessage(
+			`{"type":"response","response_to":"get_version_info","error_message":"","result":null,"format":"json_v3.3"}`,
+		)); err != nil {
+			return err
+		}
+
+		command, err = readTestCommand(socket)
+		if err != nil {
+			return err
+		}
+		if command.Command != "get_config" {
+			return fmt.Errorf("second command = %q", command.Command)
+		}
+		return writeTestFrame(socket, configResponse())
+	})
+
+	conn := dialTestPeer(t, peer.address)
+	_, err := conn.Info(t.Context())
+	var protocolErr *ProtocolError
+	if !errors.As(err, &protocolErr) {
+		t.Fatalf("Info error = %T %v", err, err)
+	}
+	if protocolErr.Operation != "decode message" || protocolErr.MessageType != "response" {
+		t.Fatalf("protocol error = %#v", protocolErr)
+	}
+	assertStillConnected(t, conn)
+
+	select {
+	case sample := <-conn.UnhandledFrames():
+		t.Fatalf("failed response was also published: %#v", sample)
+	default:
+	}
+
+	config, err := conn.Config(t.Context())
+	if err != nil {
+		t.Fatalf("command after undecodable response: %v", err)
+	}
+	if config.SpeedOfSound != 1480 {
+		t.Fatalf("config = %#v", config)
 	}
 	peer.wait(t)
 }
@@ -310,7 +384,7 @@ func TestPeerClosurePublishesEOF(t *testing.T) {
 	}
 	waitForClosed(t, "velocity reports", conn.VelocityReports())
 	waitForClosed(t, "dead-reckoning reports", conn.DeadReckoningReports())
-	waitForClosed(t, "unknown reports", conn.UnknownReports())
+	waitForClosed(t, "unhandled frames", conn.UnhandledFrames())
 }
 
 func TestCloseIsIdempotentAndPublishesNetErrClosed(t *testing.T) {
@@ -335,51 +409,265 @@ func TestCloseIsIdempotentAndPublishesNetErrClosed(t *testing.T) {
 	}
 	assertClosed(t, "velocity reports", conn.VelocityReports())
 	assertClosed(t, "dead-reckoning reports", conn.DeadReckoningReports())
-	assertClosed(t, "unknown reports", conn.UnknownReports())
+	assertClosed(t, "unhandled frames", conn.UnhandledFrames())
 	peer.wait(t)
 }
 
-func TestMalformedKnownReportEndsConnection(t *testing.T) {
-	peer := startTestPeer(t, func(socket net.Conn) error {
-		return writeTestFrame(socket, map[string]any{
-			"type":   "velocity",
-			"format": ProtocolJSONV3_3,
+// TestUndecodableFrameIsReportedAndConnectionContinues walks the non-fatal rows
+// of the reader policy: the frame appears on the unhandled stream, the
+// connection stays up, and both reports and commands keep working on it.
+func TestUndecodableFrameIsReportedAndConnectionContinues(t *testing.T) {
+	tests := []struct {
+		name            string
+		frame           string
+		messageType     string
+		protocolVersion ProtocolVersion
+		wantErr         bool
+	}{
+		{
+			name:    "not a JSON object",
+			frame:   `[1,2,3]`,
+			wantErr: true,
+		},
+		{
+			name:            "JSON object without type",
+			frame:           `{"format":"json_v3.3","vx":0.1}`,
+			protocolVersion: ProtocolJSONV3_3,
+			wantErr:         true,
+		},
+		{
+			name:        "report without format",
+			frame:       `{"type":"velocity"}`,
+			messageType: "velocity",
+			wantErr:     true,
+		},
+		{
+			name:            "report outside the json_v3 family",
+			frame:           `{"type":"temperature","format":"json_v4.0","celsius":20}`,
+			messageType:     "temperature",
+			protocolVersion: "json_v4.0",
+			wantErr:         true,
+		},
+		{
+			name:            "well-formed report of unmodelled type",
+			frame:           `{"type":"temperature","format":"json_v3.4","celsius":20}`,
+			messageType:     "temperature",
+			protocolVersion: "json_v3.4",
+		},
+		{
+			name:            "malformed velocity report",
+			frame:           `{"type":"velocity","format":"json_v3.3"}`,
+			messageType:     "velocity",
+			protocolVersion: ProtocolJSONV3_3,
+			wantErr:         true,
+		},
+		{
+			name:            "malformed water velocity report",
+			frame:           `{"type":"velocity_water","format":"json_v3.3","vx":"fast"}`,
+			messageType:     "velocity_water",
+			protocolVersion: ProtocolJSONV3_3,
+			wantErr:         true,
+		},
+		{
+			name:            "malformed dead-reckoning report",
+			frame:           `{"type":"position_local","format":"json_v3.3"}`,
+			messageType:     "position_local",
+			protocolVersion: ProtocolJSONV3_3,
+			wantErr:         true,
+		},
+		{
+			name:            "undecodable response with no command pending",
+			frame:           `{"type":"response","format":"json_v3.3","success":true,"error_message":"","result":null}`,
+			messageType:     "response",
+			protocolVersion: ProtocolJSONV3_3,
+			wantErr:         true,
+		},
+		{
+			name:            "unsolicited response",
+			frame:           `{"type":"response","response_to":"get_config","success":true,"error_message":"","result":null,"format":"json_v3.3"}`,
+			messageType:     "response",
+			protocolVersion: ProtocolJSONV3_3,
+			wantErr:         true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			peer := startTestPeer(t, func(socket net.Conn) error {
+				if err := writeTestFrame(socket, json.RawMessage(test.frame)); err != nil {
+					return err
+				}
+				if err := writeTestFrame(socket, velocityFrame(7)); err != nil {
+					return err
+				}
+				command, err := readTestCommand(socket)
+				if err != nil {
+					return err
+				}
+				if command.Command != "get_version_info" {
+					return fmt.Errorf("command = %q", command.Command)
+				}
+				return writeTestFrame(socket, infoResponse(true, ""))
+			})
+
+			conn := dialTestPeer(t, peer.address)
+			select {
+			case sample := <-conn.UnhandledFrames():
+				frame := sample.Report
+				if frame.Type != test.messageType {
+					t.Fatalf("type = %q, want %q", frame.Type, test.messageType)
+				}
+				if frame.ProtocolVersion != test.protocolVersion {
+					t.Fatalf("protocol version = %q, want %q", frame.ProtocolVersion, test.protocolVersion)
+				}
+				if string(frame.Raw) != test.frame {
+					t.Fatalf("raw = %q, want %q", frame.Raw, test.frame)
+				}
+				var protocolErr *ProtocolError
+				switch {
+				case !test.wantErr && frame.Err != nil:
+					t.Fatalf("err = %v, want nil", frame.Err)
+				case test.wantErr && !errors.As(frame.Err, &protocolErr):
+					t.Fatalf("err = %T %v", frame.Err, frame.Err)
+				case test.wantErr && protocolErr.Operation != "decode message":
+					t.Fatalf("protocol error = %#v", protocolErr)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for unhandled frame")
+			}
+
+			assertStillConnected(t, conn)
+			assertVelocityAndCommandStillWork(t, conn)
+			peer.wait(t)
 		})
-	})
-	conn := dialTestPeer(t, peer.address)
-	peer.wait(t)
-	<-conn.Done()
-
-	var protocolErr *ProtocolError
-	if !errors.As(conn.Err(), &protocolErr) {
-		t.Fatalf("Err = %T %v", conn.Err(), conn.Err())
-	}
-	if protocolErr.MessageType != "velocity" {
-		t.Fatalf("protocol error = %#v", protocolErr)
 	}
 }
 
-func TestUnexpectedResponseEndsConnectionWithoutBlockingLaterCommands(t *testing.T) {
+func TestBlankFramesAreSkippedSilently(t *testing.T) {
+	release := make(chan struct{})
 	peer := startTestPeer(t, func(socket net.Conn) error {
-		return writeTestFrame(socket, successResponse("get_config", nil))
+		for _, blank := range []string{``, `   `, "	"} {
+			if err := writeTestFrame(socket, json.RawMessage(blank)); err != nil {
+				return err
+			}
+		}
+		if err := writeTestFrame(socket, velocityFrame(7)); err != nil {
+			return err
+		}
+		command, err := readTestCommand(socket)
+		if err != nil {
+			return err
+		}
+		if command.Command != "get_version_info" {
+			return fmt.Errorf("command = %q", command.Command)
+		}
+		if err := writeTestFrame(socket, infoResponse(true, "")); err != nil {
+			return err
+		}
+		<-release
+		return nil
 	})
-	conn := dialTestPeer(t, peer.address)
-	peer.wait(t)
 
+	conn := dialTestPeer(t, peer.address)
+	assertVelocityAndCommandStillWork(t, conn)
+
+	// The blanks preceded the velocity report on the wire, so anything they
+	// published would already be queued.
+	select {
+	case sample := <-conn.UnhandledFrames():
+		t.Fatalf("blank frame was reported: %#v", sample)
+	default:
+	}
+	assertStillConnected(t, conn)
+
+	close(release)
+	peer.wait(t)
+}
+
+func TestMiscorrelatedResponseEndsConnection(t *testing.T) {
+	peer := startTestPeer(t, func(socket net.Conn) error {
+		command, err := readTestCommand(socket)
+		if err != nil {
+			return err
+		}
+		if command.Command != "get_config" {
+			return fmt.Errorf("command = %q", command.Command)
+		}
+		return writeTestFrame(socket, successResponse("set_config", nil))
+	})
+
+	conn := dialTestPeer(t, peer.address)
+	if _, err := conn.Config(t.Context()); err == nil {
+		t.Fatal("miscorrelated response accepted")
+	}
 	select {
 	case <-conn.Done():
 	case <-time.After(time.Second):
-		t.Fatal("unexpected response did not end connection")
+		t.Fatal("miscorrelated response did not end connection")
 	}
 	var protocolErr *ProtocolError
 	if !errors.As(conn.Err(), &protocolErr) {
 		t.Fatalf("Err = %T %v", conn.Err(), conn.Err())
+	}
+	if protocolErr.Operation != "correlate response" || protocolErr.MessageType != "set_config" {
+		t.Fatalf("protocol error = %#v", protocolErr)
+	}
+	peer.wait(t)
+}
+
+func TestOversizedFrameEndsConnection(t *testing.T) {
+	peer := startTestPeer(t, func(socket net.Conn) error {
+		// The client closes the socket once framing is lost, so a short write
+		// here is the expected outcome rather than a failure.
+		_, _ = socket.Write(bytes.Repeat([]byte("a"), maximumFrameSize+1))
+		return nil
+	})
+
+	conn := dialTestPeer(t, peer.address)
+	select {
+	case <-conn.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("oversized frame did not end connection")
+	}
+	if !errors.Is(conn.Err(), bufio.ErrTooLong) {
+		t.Fatalf("Err = %v, want bufio.ErrTooLong", conn.Err())
+	}
+	peer.wait(t)
+}
+
+func assertStillConnected(t *testing.T, conn *Conn) {
+	t.Helper()
+	select {
+	case <-conn.Done():
+		t.Fatalf("connection ended: %v", conn.Err())
+	default:
+	}
+}
+
+// assertVelocityAndCommandStillWork consumes the velocity report the test peer
+// sends after the frame under test and runs one command on the same connection.
+func assertVelocityAndCommandStillWork(t *testing.T, conn *Conn) {
+	t.Helper()
+	select {
+	case sample, ok := <-conn.VelocityReports():
+		if !ok {
+			t.Fatalf("velocity stream closed: %v", conn.Err())
+		}
+		if sample.Report.Interval != 7*time.Millisecond {
+			t.Fatalf("interval = %s, want 7ms", sample.Report.Interval)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the following velocity report")
 	}
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	if _, err := conn.Info(ctx); !errors.Is(err, conn.Err()) {
-		t.Fatalf("Info after unexpected response = %v, want %v", err, conn.Err())
+	info, err := conn.Info(ctx)
+	if err != nil {
+		t.Fatalf("command on the same connection: %v", err)
+	}
+	if info.ProductName != "DVL A50" {
+		t.Fatalf("info = %#v", info)
 	}
 }
 

@@ -2,6 +2,7 @@ package dvl
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -40,7 +41,7 @@ type connState struct {
 
 	velocity      reportStream[*VelocityReport]
 	deadReckoning reportStream[*DeadReckoningReport]
-	unknown       reportStream[*UnknownReport]
+	unhandled     reportStream[UnhandledFrame]
 	commands      chan commandRequest
 	workers       sync.WaitGroup
 
@@ -67,8 +68,11 @@ type commandResult struct {
 }
 
 type pendingCommand struct {
-	name      string
-	response  chan commandResponse
+	name string
+
+	// outcome carries either the correlated response or the decoding error that
+	// stopped the reader from producing one.
+	outcome   chan commandResult
 	processed chan struct{}
 	delivered bool
 }
@@ -94,7 +98,7 @@ func Dial(ctx context.Context, address string) (*Conn, error) {
 		socket:        socket,
 		velocity:      newReportStream[*VelocityReport](),
 		deadReckoning: newReportStream[*DeadReckoningReport](),
-		unknown:       newReportStream[*UnknownReport](),
+		unhandled:     newReportStream[UnhandledFrame](),
 		commands:      make(chan commandRequest),
 		ctx:           lifetime,
 		cancel:        cancel,
@@ -110,7 +114,7 @@ func Dial(ctx context.Context, address string) (*Conn, error) {
 	}
 	start(func() { state.velocity.run(state.ctx.Done()) })
 	start(func() { state.deadReckoning.run(state.ctx.Done()) })
-	start(func() { state.unknown.run(state.ctx.Done()) })
+	start(func() { state.unhandled.run(state.ctx.Done()) })
 	start(state.runCommands)
 	start(state.readMessages)
 
@@ -137,11 +141,12 @@ func (c *Conn) DeadReckoningReports() <-chan Sample[*DeadReckoningReport] {
 	return c.state.deadReckoning.output
 }
 
-// UnknownReports returns well-formed report types unknown to this version of
-// the package. Its buffering and receiver semantics match VelocityReports, with
-// independent loss accounting.
-func (c *Conn) UnknownReports() <-chan Sample[*UnknownReport] {
-	return c.state.unknown.output
+// UnhandledFrames returns frames that could not be decoded into a typed
+// report, including well-formed reports of unknown type. Its buffering and
+// receiver semantics match VelocityReports, with independent loss accounting.
+// Receiving from it is optional; an absent consumer never blocks the reader.
+func (c *Conn) UnhandledFrames() <-chan Sample[UnhandledFrame] {
+	return c.state.unhandled.output
 }
 
 // Done is closed when the connection ends. It is a broadcast lifecycle signal
@@ -299,7 +304,7 @@ func (s *connState) runCommands() {
 func (s *connState) runCommand(request commandRequest) {
 	pending := &pendingCommand{
 		name:      request.name,
-		response:  make(chan commandResponse, 1),
+		outcome:   make(chan commandResult, 1),
 		processed: make(chan struct{}),
 	}
 	s.pendingMu.Lock()
@@ -318,12 +323,12 @@ func (s *connState) runCommand(request commandRequest) {
 	defer timer.Stop()
 
 	select {
-	case response := <-pending.response:
-		s.finishCommand(request, pending, response)
+	case outcome := <-pending.outcome:
+		s.finishCommand(request, pending, outcome)
 	case <-timer.C:
 		select {
-		case response := <-pending.response:
-			s.finishCommand(request, pending, response)
+		case outcome := <-pending.outcome:
+			s.finishCommand(request, pending, outcome)
 			return
 		default:
 		}
@@ -337,8 +342,8 @@ func (s *connState) runCommand(request commandRequest) {
 		request.complete <- commandResult{err: context.Cause(s.ctx)}
 	case <-s.ctx.Done():
 		select {
-		case response := <-pending.response:
-			s.finishCommand(request, pending, response)
+		case outcome := <-pending.outcome:
+			s.finishCommand(request, pending, outcome)
 			return
 		default:
 		}
@@ -347,18 +352,26 @@ func (s *connState) runCommand(request commandRequest) {
 	}
 }
 
-func (s *connState) finishCommand(request commandRequest, pending *pendingCommand, response commandResponse) {
+// finishCommand retires the pending slot and hands outcome to the caller. A
+// response the caller cannot use fails that one command: an undecodable result
+// says nothing about the connection's framing or its correlation, so the
+// connection stays up.
+func (s *connState) finishCommand(request commandRequest, pending *pendingCommand, outcome commandResult) {
 	defer close(pending.processed)
 	s.clearPending(pending)
+	if outcome.err != nil {
+		request.complete <- outcome
+		return
+	}
+
+	response := outcome.response
 	if response.Success && request.validate != nil {
 		if err := request.validate(response); err != nil {
-			terminalErr := &ProtocolError{
+			request.complete <- commandResult{err: &ProtocolError{
 				Operation:   "decode response",
 				MessageType: response.ResponseTo,
 				Err:         err,
-			}
-			s.terminate(terminalErr)
-			request.complete <- commandResult{err: context.Cause(s.ctx)}
+			}}
 			return
 		}
 	}
@@ -402,52 +415,33 @@ func (s *connState) readMessages() {
 	scanner.Buffer(make([]byte, 4096), maximumFrameSize)
 
 	for scanner.Scan() {
-		frame := scanner.Bytes()
+		frame := bytes.TrimSpace(scanner.Bytes())
 		if len(frame) == 0 {
 			continue
 		}
 
-		message, err := decodeMessage(frame)
-		if err != nil {
-			s.terminate(&ProtocolError{
-				Operation:   "decode message",
-				MessageType: message.messageType,
-				Err:         err,
-			})
-			return
-		}
-
-		if message.response != nil {
-			if !s.deliverResponse(*message.response) {
+		// decodeMessage resolves every frame into exactly one payload, so a frame
+		// we cannot decode is reported rather than fatal. Only framing and
+		// command correlation end the connection.
+		message := decodeMessage(frame)
+		switch {
+		case message.response != nil:
+			if !s.deliverResponse(frame, *message.response) {
 				return
 			}
-			continue
-		}
-		if message.velocity != nil {
+		case message.velocity != nil:
 			if !s.velocity.publish(s.ctx.Done(), message.velocity) {
 				return
 			}
-			continue
-		}
-		if message.deadReckoning != nil {
+		case message.deadReckoning != nil:
 			if !s.deadReckoning.publish(s.ctx.Done(), message.deadReckoning) {
 				return
 			}
-			continue
-		}
-		if message.unknown != nil {
-			if !s.unknown.publish(s.ctx.Done(), message.unknown) {
+		case message.unhandled != nil:
+			if !s.reportUnhandled(*message.unhandled) {
 				return
 			}
-			continue
 		}
-
-		s.terminate(&ProtocolError{
-			Operation:   "decode message",
-			MessageType: message.messageType,
-			Err:         errors.New("decoded message has no payload"),
-		})
-		return
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -457,17 +451,55 @@ func (s *connState) readMessages() {
 	s.terminate(io.EOF)
 }
 
-func (s *connState) deliverResponse(response commandResponse) bool {
+// reportUnhandled publishes frame on the unhandled stream, except when it is a
+// response that a command is still waiting for: that command receives the
+// decoding error instead. It reports false when the connection ended.
+func (s *connState) reportUnhandled(frame UnhandledFrame) bool {
+	if frame.Type == "response" && s.failPendingCommand(frame.Err) {
+		return true
+	}
+	return s.unhandled.publish(s.ctx.Done(), frame)
+}
+
+// failPendingCommand hands err to the command awaiting a response and waits for
+// it to retire the pending slot. It reports false when no command was waiting,
+// or when the connection ended before the command retired.
+func (s *connState) failPendingCommand(err error) bool {
+	s.pendingMu.Lock()
+	pending := s.pending
+	if pending == nil || pending.delivered {
+		s.pendingMu.Unlock()
+		return false
+	}
+	pending.delivered = true
+	outcome := pending.outcome
+	s.pendingMu.Unlock()
+
+	outcome <- commandResult{err: err}
+	select {
+	case <-pending.processed:
+		return true
+	case <-s.ctx.Done():
+		return false
+	}
+}
+
+// deliverResponse routes response to the command awaiting it. A response that
+// arrives with no command pending is reported as an unhandled frame; one that
+// names a different command, or a second response to a command still in flight,
+// makes correlation ambiguous and ends the connection. It reports false when
+// the reader must stop.
+func (s *connState) deliverResponse(frame []byte, response commandResponse) bool {
 	s.pendingMu.Lock()
 	pending := s.pending
 	if pending == nil {
 		s.pendingMu.Unlock()
-		s.terminate(&ProtocolError{
-			Operation:   "correlate response",
-			MessageType: response.ResponseTo,
-			Err:         errors.New("response has no pending command"),
-		})
-		return false
+		return s.unhandled.publish(s.ctx.Done(), *unhandledFrame(
+			frame,
+			"response",
+			response.Format,
+			fmt.Errorf("unsolicited response to %q", response.ResponseTo),
+		))
 	}
 	if response.ResponseTo != pending.name {
 		expected := pending.name
@@ -489,10 +521,10 @@ func (s *connState) deliverResponse(response commandResponse) bool {
 		return false
 	}
 	pending.delivered = true
-	responseChannel := pending.response
+	outcome := pending.outcome
 	s.pendingMu.Unlock()
 
-	responseChannel <- response
+	outcome <- commandResult{response: response}
 	select {
 	case <-pending.processed:
 		return true

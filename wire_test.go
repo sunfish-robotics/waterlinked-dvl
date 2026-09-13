@@ -2,6 +2,7 @@ package dvl
 
 import (
 	"encoding/json"
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -12,15 +13,9 @@ const velocityFixture = `{"time":189.83340454101562,"vx":0.00046143701183609664,
 func TestDecodeVelocityReportFromZoda(t *testing.T) {
 	t.Parallel()
 
-	message, err := decodeMessage([]byte(velocityFixture))
-	if err != nil {
-		t.Fatal(err)
-	}
+	message := decodeMessage([]byte(velocityFixture))
 	if message.response != nil {
 		t.Fatal("velocity decoded as response")
-	}
-	if message.messageType != "velocity" {
-		t.Fatalf("message type = %q", message.messageType)
 	}
 
 	velocity := message.velocity
@@ -73,11 +68,7 @@ func TestDecodeWaterVelocityWithoutAltitude(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	decoded, err := decodeMessage(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	velocity := decoded.velocity
+	velocity := decodeMessage(data).velocity
 	if velocity == nil {
 		t.Fatal("velocity report is nil")
 	}
@@ -93,11 +84,7 @@ func TestDecodeDeadReckoningReport(t *testing.T) {
 	t.Parallel()
 
 	data := []byte(`{"ts":1789228180.928221,"x":12.4,"y":64.6,"z":1.7,"std":0.002,"roll":0.6,"pitch":0.7,"yaw":90.1,"type":"position_local","status":0,"format":"json_v3.3"}`)
-	message, err := decodeMessage(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	position := message.deadReckoning
+	position := decodeMessage(data).deadReckoning
 	if position == nil {
 		t.Fatal("dead-reckoning report is nil")
 	}
@@ -112,42 +99,111 @@ func TestDecodeDeadReckoningReport(t *testing.T) {
 	}
 }
 
-func TestDecodeUnknownReportOwnsRawMessage(t *testing.T) {
+func TestDecodeUnknownTypeIsUnhandledWithoutErrorAndOwnsItsFrame(t *testing.T) {
 	t.Parallel()
 
 	data := []byte(`{"type":"temperature","format":"json_v3.4","celsius":20}`)
-	message, err := decodeMessage(data)
+	unhandled := decodeMessage(data).unhandled
+	if unhandled == nil {
+		t.Fatal("unhandled frame is nil")
+	}
+	data[0] = 'x'
+	if !json.Valid(unhandled.Raw) {
+		t.Fatalf("raw frame aliases input: %q", unhandled.Raw)
+	}
+	if unhandled.Type != "temperature" || unhandled.ProtocolVersion != "json_v3.4" {
+		t.Fatalf("unhandled frame = %#v", unhandled)
+	}
+	if unhandled.Err != nil {
+		t.Fatalf("well-formed unknown type carries an error: %v", unhandled.Err)
+	}
+}
+
+func TestDecodeReportsUndecodableFramesAsProtocolErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		frame       string
+		messageType string
+	}{
+		{name: "not a JSON object", frame: `[1,2,3]`},
+		{name: "object without type", frame: `{"format":"json_v3.3"}`},
+		{name: "unsupported protocol major", frame: `{"type":"temperature","format":"json_v4.0","celsius":20}`, messageType: "temperature"},
+		{name: "report without format", frame: `{"type":"velocity"}`, messageType: "velocity"},
+		{name: "incomplete velocity report", frame: `{"type":"velocity","format":"json_v3.3"}`, messageType: "velocity"},
+		{name: "incomplete dead-reckoning report", frame: `{"type":"position_local","format":"json_v3.3"}`, messageType: "position_local"},
+		{name: "response without response_to", frame: `{"type":"response","format":"json_v3.3","success":true,"error_message":"","result":null}`, messageType: "response"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			unhandled := decodeMessage([]byte(test.frame)).unhandled
+			if unhandled == nil {
+				t.Fatalf("frame %s was not reported as unhandled", test.frame)
+			}
+			if unhandled.Type != test.messageType {
+				t.Fatalf("type = %q, want %q", unhandled.Type, test.messageType)
+			}
+			if string(unhandled.Raw) != test.frame {
+				t.Fatalf("raw = %q, want %q", unhandled.Raw, test.frame)
+			}
+			var protocolErr *ProtocolError
+			if !errors.As(unhandled.Err, &protocolErr) {
+				t.Fatalf("err = %T %v", unhandled.Err, unhandled.Err)
+			}
+			if protocolErr.Operation != "decode message" || protocolErr.MessageType != test.messageType {
+				t.Fatalf("protocol error = %#v", protocolErr)
+			}
+		})
+	}
+}
+
+func TestDecodeAcceptsAnyTransducerSet(t *testing.T) {
+	t.Parallel()
+
+	var frame map[string]any
+	if err := json.Unmarshal([]byte(velocityFixture), &frame); err != nil {
+		t.Fatal(err)
+	}
+	beam := func(id int) map[string]any {
+		return map[string]any{
+			"id": id, "velocity": 0.1, "distance": 2.4,
+			"rssi": -40.0, "nsd": -90.0, "beam_valid": true,
+		}
+	}
+	frame["transducers"] = []map[string]any{beam(9), beam(9), beam(0), beam(1), beam(2), beam(3)}
+	data, err := json.Marshal(frame)
 	if err != nil {
 		t.Fatal(err)
 	}
-	unknown := message.unknown
-	if unknown == nil {
-		t.Fatal("unknown report is nil")
+
+	velocity := decodeMessage(data).velocity
+	if velocity == nil {
+		t.Fatalf("velocity report rejected: %#v", decodeMessage(data).unhandled)
 	}
-	data[0] = 'x'
-	if !json.Valid(unknown.Raw) {
-		t.Fatalf("raw message aliases input: %q", unknown.Raw)
-	}
-	if unknown.Type != "temperature" || unknown.ProtocolVersion != "json_v3.4" {
-		t.Fatalf("unknown report = %#v", unknown)
+	if len(velocity.Transducers) != 6 || velocity.Transducers[0].ID != 9 {
+		t.Fatalf("transducers = %#v", velocity.Transducers)
 	}
 }
 
-func TestDecodeRejectsUnsupportedProtocolMajor(t *testing.T) {
+func TestDecodeConfigAcceptsValuesTheClientWouldNotSend(t *testing.T) {
 	t.Parallel()
 
-	_, err := decodeMessage([]byte(`{"type":"temperature","format":"json_v4.0","celsius":20}`))
-	if err == nil {
-		t.Fatal("unsupported protocol major accepted")
+	config, err := decodeConfig([]byte(`{
+		"speed_of_sound": 900,
+		"mounting_rotation_offset": 400,
+		"acoustic_enabled": true,
+		"dark_mode_enabled": false,
+		"range_mode": "chirp",
+		"periodic_cycling_enabled": true
+	}`))
+	if err != nil {
+		t.Fatalf("device-reported configuration rejected: %v", err)
 	}
-}
-
-func TestDecodeKnownReportRequiresCompleteShape(t *testing.T) {
-	t.Parallel()
-
-	_, err := decodeMessage([]byte(`{"type":"velocity","format":"json_v3.3"}`))
-	if err == nil {
-		t.Fatal("incomplete velocity report accepted")
+	if config.SpeedOfSound != 900 || config.MountingYawOffset != 400 || config.RangeMode != "chirp" {
+		t.Fatalf("config = %#v", config)
 	}
 }
 
@@ -230,11 +286,26 @@ func TestDecodeResponseRequiresCorrelationFields(t *testing.T) {
 	}
 }
 
+func TestMillisecondsKeepsNegativeIntervals(t *testing.T) {
+	t.Parallel()
+
+	interval, err := milliseconds(-1.5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interval != -1500*time.Microsecond {
+		t.Fatalf("interval = %s, want -1.5ms", interval)
+	}
+}
+
 func TestTimeConversionsRejectValuesThatRoundOutsideInt64(t *testing.T) {
 	t.Parallel()
 
 	if _, err := milliseconds(float64(math.MaxInt64) / float64(time.Millisecond)); err == nil {
 		t.Fatal("duration rounding beyond MaxInt64 accepted")
+	}
+	if _, err := milliseconds(-float64(math.MaxInt64) / float64(time.Millisecond)); err == nil {
+		t.Fatal("duration rounding beyond MinInt64 accepted")
 	}
 	if _, err := unixSeconds(float64(math.MaxInt64) / 1e6); err == nil {
 		t.Fatal("timestamp rounding beyond MaxInt64 accepted")

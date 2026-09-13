@@ -15,7 +15,7 @@ var (
 	_ interface {
 		VelocityReports() <-chan dvl.Sample[*dvl.VelocityReport]
 		DeadReckoningReports() <-chan dvl.Sample[*dvl.DeadReckoningReport]
-		UnknownReports() <-chan dvl.Sample[*dvl.UnknownReport]
+		UnhandledFrames() <-chan dvl.Sample[dvl.UnhandledFrame]
 		Done() <-chan struct{}
 		Err() error
 	} = (*dvl.Conn)(nil)

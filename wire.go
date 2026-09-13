@@ -1,6 +1,7 @@
 package dvl
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,12 +24,15 @@ type commandResponse struct {
 	Format       ProtocolVersion
 }
 
+// decodedMessage is one frame resolved into exactly one payload. A frame that
+// could not be turned into a typed report becomes an unhandled payload rather
+// than an error, so the reader can report it and carry on. FuzzDecodeMessage
+// guards the exactly-one invariant.
 type decodedMessage struct {
-	messageType   string
 	response      *commandResponse
 	velocity      *VelocityReport
 	deadReckoning *DeadReckoningReport
-	unknown       *UnknownReport
+	unhandled     *UnhandledFrame
 }
 
 type messageHeader struct {
@@ -103,40 +107,65 @@ type configWire struct {
 	PeriodicCyclingEnabled *bool    `json:"periodic_cycling_enabled"`
 }
 
-func decodeMessage(data []byte) (decodedMessage, error) {
+func decodeMessage(data []byte) decodedMessage {
 	var header messageHeader
 	if err := json.Unmarshal(data, &header); err != nil {
-		return decodedMessage{}, err
+		return decodedMessage{unhandled: unhandledFrame(data, "", "", err)}
 	}
-	message := decodedMessage{messageType: header.Type}
 	if header.Type == "" {
-		return message, errors.New("missing type")
+		return decodedMessage{unhandled: unhandledFrame(data, "", header.Format, errors.New("missing type"))}
 	}
+
+	// Responses are decoded whatever their format claims to be: command
+	// correlation must not depend on a field the device may version on its own.
+	if header.Type == "response" {
+		response, err := decodeResponse(data)
+		if err != nil {
+			return decodedMessage{unhandled: unhandledFrame(data, header.Type, header.Format, err)}
+		}
+		return decodedMessage{response: &response}
+	}
+
 	if !supportedProtocolVersion(header.Format) {
-		return message, fmt.Errorf("unsupported format %q", header.Format)
+		cause := fmt.Errorf("unsupported format %q", header.Format)
+		return decodedMessage{unhandled: unhandledFrame(data, header.Type, header.Format, cause)}
 	}
 
 	switch header.Type {
 	case "velocity", "velocity_water":
-		var err error
-		message.velocity, err = decodeVelocityReport(data)
-		return message, err
+		report, err := decodeVelocityReport(data)
+		if err != nil {
+			return decodedMessage{unhandled: unhandledFrame(data, header.Type, header.Format, err)}
+		}
+		return decodedMessage{velocity: report}
 	case "position_local":
-		var err error
-		message.deadReckoning, err = decodeDeadReckoningReport(data)
-		return message, err
-	case "response":
-		response, err := decodeResponse(data)
-		message.response = &response
-		return message, err
+		report, err := decodeDeadReckoningReport(data)
+		if err != nil {
+			return decodedMessage{unhandled: unhandledFrame(data, header.Type, header.Format, err)}
+		}
+		return decodedMessage{deadReckoning: report}
 	default:
-		raw := append(json.RawMessage(nil), data...)
-		message.unknown = &UnknownReport{
+		return decodedMessage{unhandled: &UnhandledFrame{
 			Type:            header.Type,
 			ProtocolVersion: header.Format,
-			Raw:             raw,
-		}
-		return message, nil
+			Raw:             bytes.Clone(data),
+		}}
+	}
+}
+
+// unhandledFrame describes a frame that could not be decoded. Every such frame
+// carries a *ProtocolError for the operation that failed, so callers can
+// distinguish it from a well-formed report of an unmodelled type.
+func unhandledFrame(data []byte, messageType string, format ProtocolVersion, cause error) *UnhandledFrame {
+	return &UnhandledFrame{
+		Type:            messageType,
+		ProtocolVersion: format,
+		Raw:             bytes.Clone(data),
+		Err: &ProtocolError{
+			Operation:   "decode message",
+			MessageType: messageType,
+			Err:         cause,
+		},
 	}
 }
 
@@ -228,13 +257,11 @@ func decodeVelocityReport(data []byte) (*VelocityReport, error) {
 	}, nil
 }
 
+// decodeTransducers accepts whatever set of beams the device reports: the
+// protocol does not fix their count or their ids, only the fields each entry
+// carries.
 func decodeTransducers(wire []transducerWire) ([]TransducerReading, error) {
-	if len(wire) != 4 {
-		return nil, fmt.Errorf("transducers: got %d, want 4", len(wire))
-	}
-
 	readings := make([]TransducerReading, len(wire))
-	var seen [4]bool
 	for index, transducer := range wire {
 		missing := missingFields(map[string]bool{
 			"id":         transducer.ID != nil,
@@ -247,13 +274,6 @@ func decodeTransducers(wire []transducerWire) ([]TransducerReading, error) {
 		if missing != "" {
 			return nil, fmt.Errorf("transducer %d: missing %s", index, missing)
 		}
-		if *transducer.ID >= uint8(len(seen)) {
-			return nil, fmt.Errorf("transducer %d: id %d outside 0-3", index, *transducer.ID)
-		}
-		if seen[*transducer.ID] {
-			return nil, fmt.Errorf("transducer %d: duplicate id %d", index, *transducer.ID)
-		}
-		seen[*transducer.ID] = true
 
 		readings[index] = TransducerReading{
 			ID:        *transducer.ID,
@@ -354,16 +374,10 @@ func decodeConfig(data []byte) (Config, error) {
 	if missing != "" {
 		return Config{}, fmt.Errorf("missing %s", missing)
 	}
-	if err := validateSpeedOfSound(*wire.SpeedOfSound); err != nil {
-		return Config{}, err
-	}
-	if err := validateMountingYawOffset(*wire.MountingYawOffset); err != nil {
-		return Config{}, err
-	}
-	if !validRangeMode(RangeMode(*wire.RangeMode)) {
-		return Config{}, fmt.Errorf("range_mode: invalid value %q", *wire.RangeMode)
-	}
 
+	// The values are not validated: the device is the authority on its own
+	// state, and refusing to report it would tell the caller less, not more.
+	// encodeConfigUpdate still validates what we send.
 	return Config{
 		SpeedOfSound:           *wire.SpeedOfSound,
 		MountingYawOffset:      *wire.MountingYawOffset,
@@ -472,12 +486,16 @@ func missingFields(fields map[string]bool) string {
 	return strings.Join(missing, ", ")
 }
 
+// milliseconds converts a device-reported interval. time.Duration is signed,
+// so negative values are carried through rather than rejected; only values that
+// are not finite or do not fit an int64 of nanoseconds are refused.
 func milliseconds(value float64) (time.Duration, error) {
-	if !finite(value) || value < 0 {
+	if !finite(value) {
 		return 0, fmt.Errorf("invalid millisecond duration %v", value)
 	}
 	nanoseconds := math.Round(value * float64(time.Millisecond))
-	if !finite(nanoseconds) || nanoseconds >= float64(math.MaxInt64) {
+	if !finite(nanoseconds) ||
+		nanoseconds <= float64(math.MinInt64) || nanoseconds >= float64(math.MaxInt64) {
 		return 0, fmt.Errorf("millisecond duration %v is out of range", value)
 	}
 	return time.Duration(int64(nanoseconds)), nil

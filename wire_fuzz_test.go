@@ -16,18 +16,17 @@ func FuzzDecodeMessage(f *testing.F) {
 	f.Add([]byte(`{"time":1e308,"vx":0,"vy":0,"vz":0,"fom":0,"covariance":[[0,0,0],[0,0,0],[0,0,0]],"transducers":[],"velocity_valid":true,"status":0,"format":"json_v3","type":"velocity","time_of_validity":0,"time_of_transmission":0}`))
 	f.Add([]byte(`null`))
 	f.Add([]byte(``))
+	f.Add([]byte(`[1,2,3]`))
+	f.Add([]byte(`{"type":"velocity","format":"json_v3.3"}`))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		message, err := decodeMessage(data)
-		if err != nil {
-			return
-		}
+		message := decodeMessage(data)
 		payloads := 0
 		for _, present := range []bool{
 			message.response != nil,
 			message.velocity != nil,
 			message.deadReckoning != nil,
-			message.unknown != nil,
+			message.unhandled != nil,
 		} {
 			if present {
 				payloads++
