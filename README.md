@@ -15,6 +15,37 @@ status, and transducer details.
 go get github.com/sunfish-robotics/waterlinked-dvl
 ```
 
+## Command-line tool
+
+The repository includes a dependency-free diagnostic CLI which exercises the
+exported client API against a real DVL:
+
+```console
+go install github.com/sunfish-robotics/waterlinked-dvl/cmd/waterlinked-dvl@latest
+```
+
+Read device identity and configuration, or stream typed reports until
+interrupted:
+
+```console
+waterlinked-dvl info -address 192.168.194.95
+waterlinked-dvl config get -address 192.168.194.95
+waterlinked-dvl watch -address 192.168.194.95
+waterlinked-dvl watch -address 192.168.194.95 -duration 30s -json > reports.jsonl
+```
+
+Configuration updates change only fields explicitly provided and are read back
+from the device before success is reported:
+
+```console
+waterlinked-dvl config set -address 192.168.194.95 -speed-of-sound 1480
+```
+
+`reset-dead-reckoning` resets the device's local frame. `calibrate-gyro` requires
+the DVL to remain stationary for the full calibration, which may take 15
+seconds. Run `waterlinked-dvl help` or a command with `-h` for the complete
+command surface.
+
 ## Protocol coverage
 
 The package connects to the configured DVL TCP endpoint on port `16171` and
