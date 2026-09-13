@@ -59,6 +59,44 @@ func TestConnDemultiplexesReportAndCommandResponse(t *testing.T) {
 	peer.wait(t)
 }
 
+// TestNoLockVelocityReportTraversesStream drives a velocity_valid:false report
+// through the socket, the reader, and the broker: TestDecodeVelocityReportWithoutLockHasNoMeasurement
+// covers the decoder in isolation, but nothing previously exercised the same
+// report end to end on VelocityReports.
+func TestNoLockVelocityReportTraversesStream(t *testing.T) {
+	release := make(chan struct{})
+	peer := startTestPeer(t, func(socket net.Conn) error {
+		if err := writeTestFrame(socket, velocityFrameWithoutLock(7)); err != nil {
+			return err
+		}
+		<-release
+		return nil
+	})
+
+	conn := dialTestPeer(t, peer.address)
+	select {
+	case sample := <-conn.VelocityReports():
+		report := sample.Report
+		if report.Measurement != nil {
+			t.Fatalf("measurement = %#v, want nil", report.Measurement)
+		}
+		if len(report.Transducers) != 4 {
+			t.Fatalf("transducers = %#v, want 4", report.Transducers)
+		}
+		if report.Status != 1 {
+			t.Fatalf("status = %d, want 1", report.Status)
+		}
+		if report.ValidAt.IsZero() || report.TransmittedAt.IsZero() {
+			t.Fatalf("timestamps not populated: validAt=%s transmittedAt=%s", report.ValidAt, report.TransmittedAt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for velocity report")
+	}
+
+	close(release)
+	peer.wait(t)
+}
+
 func TestSlowVelocityConsumerDoesNotBlockOtherStreamsOrCommands(t *testing.T) {
 	release := make(chan struct{})
 	peer := startTestPeer(t, func(socket net.Conn) error {
@@ -815,6 +853,16 @@ func velocityFrame(milliseconds float64) map[string]any {
 		"time_of_validity":     1789228180928221,
 		"time_of_transmission": 1789228181074924,
 	}
+}
+
+// velocityFrameWithoutLock is velocityFrame with velocity_valid false and a
+// nonzero status, so a test can tell a populated-but-withheld measurement
+// apart from Go's zero value.
+func velocityFrameWithoutLock(milliseconds float64) map[string]any {
+	frame := velocityFrame(milliseconds)
+	frame["velocity_valid"] = false
+	frame["status"] = 1
+	return frame
 }
 
 func deadReckoningFrame() map[string]any {
