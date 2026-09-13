@@ -141,10 +141,11 @@
 //
 // The package targets A50 and A125 devices on firmware 2.4.0 or later, which
 // speak protocol json_v3.1 or later. It decodes any json_v3 minor version and
-// preserves unknown status bits and unknown report types rather than
-// rejecting them. [Conn.Info] needs firmware 2.7.2, which introduced the
-// underlying get_version_info command; its behaviour on earlier firmware has
-// not been verified. Other Water Linked models have not been tested.
+// preserves unknown status bits and unknown report types rather than rejecting
+// them. [Conn.Info] needs firmware 2.7.2, which introduced the underlying
+// get_version_info command; its behaviour on earlier firmware has not been
+// verified. Live validation covers an A50 running firmware 2.7.2. The A125
+// uses the same API but has not been exercised with this package.
 //
 // # Command-line tool
 //

@@ -15,10 +15,11 @@ installation, so they're left to you.
 
 ## Supported hardware
 
-DVL A50 and A125 running firmware 2.4.0 or later, which speak TCP JSON
-protocol json_v3.1 or later. Reading device identity with `Info` needs
-firmware 2.7.2, where the device gained the underlying command. Other Water
-Linked models have not been tested.
+The client targets DVL A50 and A125 running firmware 2.4.0 or later, which
+speak TCP JSON protocol json_v3.1 or later. Reading device identity with
+`Info` needs firmware 2.7.2, where the device gained the underlying command.
+Live validation covers an A50 running firmware 2.7.2. The A125 uses the same
+API but has not been exercised with this client.
 
 ## Installation
 
