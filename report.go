@@ -7,10 +7,13 @@ import (
 
 // Sample is one item delivered on a typed stream.
 type Sample[T any] struct {
+	// Report is the delivered item. It is a value, so the caller owns it
+	// outright once received.
 	Report T
 
 	// DroppedBefore is the number of older items from the same stream discarded
 	// since the previous delivered sample because the consumer did not keep up.
+	// It is zero when nothing was lost.
 	DroppedBefore uint64
 }
 
@@ -37,21 +40,25 @@ const (
 )
 
 // Vector3 is a three-dimensional value in the frame emitted by the DVL: X
-// forward, Y starboard, and Z down.
+// forward, Y starboard, and Z down. When the device has a mounting yaw offset
+// configured, the emitted frame is the vehicle frame rather than the DVL's
+// body frame; see Config.MountingYawOffset.
 type Vector3 struct {
 	X float64
 	Y float64
 	Z float64
 }
 
-// EulerAngles is roll, pitch, and yaw in degrees.
+// EulerAngles is an orientation in degrees: Roll about the X axis, Pitch
+// about the Y axis, and Yaw, which is heading, about the Z axis.
 type EulerAngles struct {
 	Roll  float64
 	Pitch float64
 	Yaw   float64
 }
 
-// Matrix3 is a 3×3 matrix in row-major order.
+// Matrix3 is a 3×3 matrix in row-major order. As a covariance, its rows and
+// columns are ordered X, Y, Z.
 type Matrix3 [3][3]float64
 
 // Status is the raw eight-bit status mask on a velocity report. Unknown bits
@@ -72,27 +79,36 @@ func (s Status) Has(flag Status) bool {
 // TransducerReading contains one beam's measurement and diagnostics.
 type TransducerReading struct {
 	// ID is the transducer's protocol identifier. Ids are zero-based, and
-	// A50/A125 devices report 0-3.
+	// A50/A125 devices report 0-3. Water Linked's mechanical drawings number
+	// the same transducers 1-4.
 	ID uint8
 
-	// Velocity and Distance are measured in metres per second and metres.
+	// Velocity and Distance are measured in metres per second and metres,
+	// along the beam.
 	Velocity float64
 	Distance float64
 
-	// RSSI and NSD are measured in dBm.
+	// RSSI and NSD are the received signal strength and noise spectral
+	// density, measured in dBm.
 	RSSI float64
 	NSD  float64
 
+	// BeamValid reports whether the device trusted this beam's reflection.
 	BeamValid bool
 }
 
 // VelocityReport is one velocity calculation. The fields on the report itself
 // are meaningful whether or not the DVL has a lock; the measurement is present
 // only when it does.
+//
+// The device sends one report per ping. The rate depends on altitude and is
+// between 2 and 15 Hz in bottom tracking and 2 Hz in water tracking.
 type VelocityReport struct {
+	// Reference is the surface the velocity is relative to.
 	Reference VelocityReference
 
-	// Interval is the elapsed time since the preceding velocity report.
+	// Interval is the elapsed time since the preceding velocity report, as
+	// measured by the device.
 	Interval time.Duration
 
 	// Measurement is nil when the device reports velocity_valid false. The
@@ -100,7 +116,12 @@ type VelocityReport struct {
 	// measurement fields, so they are withheld rather than passed through.
 	Measurement *VelocityMeasurement
 
-	Status        Status
+	// Status is the device's status mask; see Status for the known bits.
+	Status Status
+
+	// ValidAt is the instant of the surface reflection, which Water Linked
+	// calls the centre of ping. TransmittedAt is the instant immediately before
+	// the device sent the report. Both are read from the device's clock.
 	ValidAt       time.Time
 	TransmittedAt time.Time
 
@@ -108,12 +129,14 @@ type VelocityReport struct {
 	// report, which is how loss of lock is diagnosed.
 	Transducers []TransducerReading
 
+	// ProtocolVersion is the format the device used for this report.
 	ProtocolVersion ProtocolVersion
 }
 
 // VelocityMeasurement is the part of a velocity report that is only valid
 // while the DVL has a lock on the reflecting surface.
 type VelocityMeasurement struct {
+	// Velocity is in metres per second along each axis of the emitted frame.
 	Velocity Vector3
 
 	// FigureOfMerit is the estimated velocity standard deviation in metres per
@@ -133,22 +156,41 @@ type VelocityMeasurement struct {
 type DeadReckoningStatus uint8
 
 const (
-	DeadReckoningStatusOK    DeadReckoningStatus = 0
+	// DeadReckoningStatusOK means the device reported no dead-reckoning issue.
+	DeadReckoningStatusOK DeadReckoningStatus = 0
+
+	// DeadReckoningStatusFault means the device reported an issue. The
+	// protocol does not say which.
 	DeadReckoningStatusFault DeadReckoningStatus = 1
 )
 
 // DeadReckoningReport is the device's local position and orientation estimate.
-// Its frame is established at startup or by ResetDeadReckoning.
+// Its frame is established at startup or by ResetDeadReckoning. The device
+// sends one about every 200 milliseconds.
+//
+// Between locks the device integrates its inertial sensors alone, so position
+// error grows quickly; HorizontalStandardDeviation is how the device reports
+// that growth.
 type DeadReckoningReport struct {
-	At       time.Time
+	// At is the report's timestamp, decoded from the Unix seconds the device
+	// reports on its own clock.
+	At time.Time
+
+	// Position is the displacement in metres from the dead-reckoning origin.
 	Position Vector3
+
+	// Attitude is the orientation relative to the dead-reckoning frame. A reset
+	// zeroes all three angles.
 	Attitude EulerAngles
 
 	// HorizontalStandardDeviation is the estimated horizontal position error in
 	// metres.
 	HorizontalStandardDeviation float64
 
-	Status          DeadReckoningStatus
+	// Status is the device's dead-reckoning status.
+	Status DeadReckoningStatus
+
+	// ProtocolVersion is the format the device used for this report.
 	ProtocolVersion ProtocolVersion
 }
 
@@ -160,8 +202,15 @@ type DeadReckoningReport struct {
 type UnhandledFrame struct {
 	// Type is the frame's "type" field, or "" when the frame had none or was
 	// not a JSON object.
-	Type            string
+	Type string
+
+	// ProtocolVersion is the frame's "format" field, or "" when it had none.
 	ProtocolVersion ProtocolVersion
-	Raw             json.RawMessage
-	Err             error
+
+	// Raw is the complete frame as received, without its trailing newline.
+	Raw json.RawMessage
+
+	// Err explains why the frame could not be decoded, or is nil for a
+	// well-formed report of an unmodelled type.
+	Err error
 }

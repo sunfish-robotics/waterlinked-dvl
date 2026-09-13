@@ -4,17 +4,21 @@
 [![Go Reference][reference-badge]][go-reference]
 [![License: Apache-2.0][license-badge]][license]
 
-A Go client for the Water Linked DVL A50/A125 TCP JSON API. It provides typed
-access to velocity, water-tracking, dead-reckoning, identity, and configuration
-data while preserving the device protocol's timing, lock state, covariance,
-status, and transducer details.
+A Go client for the Water Linked DVL A50 and A125 TCP JSON API. It turns the
+device's velocity, dead-reckoning, identity, and configuration messages into
+typed Go values and delivers reports on channels, while keeping the timing,
+lock state, covariance, and per-beam detail the device provides.
+
+The package connects, decodes, and delivers. It doesn't reconnect, filter, or
+rotate measurements into your vehicle's frame. Those depend on your
+installation, so they're left to you.
 
 ## Supported hardware
 
-The package targets DVL A50/A125 devices running firmware 2.4.0 or later,
-which speak TCP JSON protocol json_v3.1 and later. `Info` additionally
-requires firmware 2.7.2, because the device did not add `get_version_info`
-until that release.
+DVL A50 and A125 running firmware 2.4.0 or later, which speak TCP JSON
+protocol json_v3.1 or later. Reading device identity with `Info` needs
+firmware 2.7.2, where the device gained the underlying command. Other Water
+Linked models have not been tested.
 
 ## Installation
 
@@ -22,119 +26,125 @@ until that release.
 go get github.com/sunfish-robotics/waterlinked-dvl
 ```
 
-## Command-line tool
+The module requires Go 1.25 or later and has no dependencies outside the
+standard library.
 
-The repository includes a dependency-free diagnostic CLI which exercises the
-exported client API against a real DVL:
+## Quick start
+
+Check that the DVL is reachable before writing any code. The diagnostic CLI
+uses the same exported API as the package:
 
 ```console
 go install github.com/sunfish-robotics/waterlinked-dvl/cmd/waterlinked-dvl@latest
-```
-
-Read device identity and configuration, or stream typed reports until
-interrupted:
-
-```console
 waterlinked-dvl info -address 192.168.194.95
-waterlinked-dvl config get -address 192.168.194.95
 waterlinked-dvl watch -address 192.168.194.95
-waterlinked-dvl watch -address 192.168.194.95 -duration 30s -json > reports.jsonl
 ```
 
-Configuration updates change only fields explicitly provided and are read back
-from the device before success is reported:
-
-```console
-waterlinked-dvl config set -address 192.168.194.95 -speed-of-sound 1480
-```
-
-`reset-dead-reckoning` resets the device's local frame. `calibrate-gyro` requires
-the DVL to remain stationary for the full calibration, which may take 15
-seconds. Run `waterlinked-dvl help` or a command with `-h` for the complete
-command surface.
-
-## Protocol coverage
-
-The package connects to the configured DVL TCP endpoint on port `16171` and
-demultiplexes every frame it reads onto one of three independent, receive-only
-streams: `VelocityReports` for `velocity` and `velocity_water` reports,
-`DeadReckoningReports` for `position_local` reports, and `UnhandledFrames` for
-everything else the package cannot turn into one of those — a malformed
-report, a report of an unknown type, or a response with no command currently
-waiting for it, such as an unsolicited response or a late one for a command
-that already finished. A response that arrives while its command is still
-waiting, but cannot be decoded, instead fails that command's own call and
-never reaches this stream. Each stream is a bounded, drop-oldest queue with
-its own loss counter, so a slow or absent consumer on one stream can never
-block another stream or a pending command.
-
-A velocity report's status, transducer readings, and timing are always
-populated. `VelocityReport.Measurement` is populated only while the DVL has a
-lock on the reflecting surface and is `nil` otherwise, so a caller cannot
-accidentally read the stale velocity, figure of merit, covariance, or altitude
-the device keeps sending after losing lock.
-
-Identity and configuration are typed commands rather than streams: `Info`,
-`Config`, `UpdateConfig`, `ResetDeadReckoning`, and `CalibrateGyro` each send
-one command and wait for its response, interleaved with report delivery on the
-same connection.
-
-## Frame policy
-
-Besides Close, a connection ends only on a transport error or EOF, a frame
-over the size cap, a failed command write, a command whose response has not
-arrived within the command timeout, no complete frame within the idle timeout
-when one is set, or a response naming a command other than the one in flight.
-Every other frame the package cannot decode is published on `UnhandledFrames`
-instead, and a response the caller cannot use fails only that one command; the
-connection and every other stream carry on.
-
-## Connecting
-
-`Dial` opens a connection with default settings. A `Dialer` configures the TCP
-dialer, an optional idle timeout that ends the connection when the device goes
-quiet, the command-response timeout, and the per-stream report buffer:
+`info` prints the device identity and firmware. `watch` prints every report
+as it arrives, so you can see the DVL acquire and lose lock. Once that works,
+the same thing in Go:
 
 ```go
-dialer := dvl.Dialer{IdleTimeout: 5 * time.Second}
-conn, err := dialer.Dial(ctx, "192.168.194.95:16171")
+package main
+
+import (
+	"context"
+	"log"
+
+	dvl "github.com/sunfish-robotics/waterlinked-dvl"
+)
+
+func main() {
+	conn, err := dvl.Dial(context.Background(), "192.168.194.95:16171")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	for sample := range conn.VelocityReports() {
+		report := sample.Report
+		if report.Measurement == nil {
+			continue // the DVL has no lock; the device's numbers are stale
+		}
+		v := report.Measurement.Velocity
+		log.Printf("%s velocity x=%.3f y=%.3f z=%.3f m/s", report.Reference, v.X, v.Y, v.Z)
+	}
+	log.Printf("connection ended: %v", conn.Err())
+}
 ```
 
-A device with acoustics disabled may legitimately send nothing, so pick an
-idle timeout with that in mind, or leave it zero to disable the check.
+The velocity channel closes when the connection ends, and `conn.Err` says why.
+A production consumer wraps this in a redial loop; the `Dialer` example in the
+package reference shows one.
 
-Each connection represents one TCP epoch. When it ends, the caller opens a new
-one and decides how and when to retry; `Conn.Done` and `Conn.Err` report when
-and why. Measurements remain in the frame emitted by the DVL so callers can
-apply installation-specific transformations deliberately.
+## What you need to know
 
-## Requirements
+Four things about the device and this package are the usual surprises. The
+[package documentation][go-reference] covers each in more depth.
 
-Waterlinked-dvl requires Go 1.25 or later.
+- **No lock means no measurement.** After losing lock the DVL keeps sending
+  velocity reports with stale numbers in them. The package sets
+  `Measurement` to nil on those reports instead of passing the numbers
+  through, so check for nil before reading velocity, covariance, or altitude.
+- **Reports and commands share one connection.** Velocity, dead-reckoning,
+  and unhandled frames arrive on three independent, bounded streams. A slow
+  consumer on one stream loses that stream's oldest reports and never blocks
+  the others or a command response. Each `Sample` says how many reports were
+  dropped before it.
+- **A connection is one epoch.** `Conn` doesn't reconnect. When it ends,
+  `Done` closes, `Err` reports the cause, and you dial again.
+- **Measurements stay in the DVL's frame.** X forward, Y starboard, Z down,
+  rotated by the device's mounting yaw offset if one is configured. Mounting
+  pitch and roll are yours to handle.
+
+## Configuring the device
+
+`Config` reads the device's settings and `UpdateConfig` changes only the
+fields you set. A successful update means the device accepted it, so read the
+configuration back if you need proof it took effect:
+
+```go
+speed := 1480.0
+if err := conn.UpdateConfig(ctx, dvl.ConfigUpdate{SpeedOfSound: &speed}); err != nil {
+	return err
+}
+after, err := conn.Config(ctx)
+```
+
+The CLI does the read-back for you:
+
+```console
+waterlinked-dvl config get
+waterlinked-dvl config set -speed-of-sound 1480
+```
+
+`ResetDeadReckoning` zeroes the local position frame and `CalibrateGyro`
+calibrates the gyroscope, which needs the DVL stationary for up to 15 seconds.
+
+## Documentation
+
+- [Package reference on pkg.go.dev][go-reference] covers connecting, the
+  report streams, lock, frames and units, timestamps, errors, and firmware
+  compatibility, with runnable examples beside the API they demonstrate.
+- [CLI reference][cli-reference] documents every `waterlinked-dvl` command.
+- Water Linked's [TCP JSON API][wl-protocol], [axes][wl-axes], and
+  [integration guide][wl-integration] describe the device side.
 
 ## Development
 
-Use the standard Go tools directly:
+Standard Go tooling, nothing else. CI runs the race-enabled tests, `gofmt`,
+and `go vet` on Go 1.25 and the current stable release, and release-please
+cuts releases from conventional commit messages. To preview the package
+documentation as pkg.go.dev will render it:
 
 ```console
-go test -race ./...
-go vet ./...
-gofmt -w .
+go run golang.org/x/pkgsite/cmd/pkgsite@latest -open .
 ```
-
-CI runs race-enabled tests on Go 1.25 and the current stable Go release, then
-checks formatting and `go vet`.
-
-## Protocol documentation
-
-- [A50/A125 TCP JSON API](https://docs.waterlinked.com/dvl/dvl-json-protocol/)
-- [Axes and mounting conventions](https://docs.waterlinked.com/dvl/axes/)
-- [Water Linked integration guide](https://docs.waterlinked.com/dvl/integration/)
 
 ## Stability
 
-Waterlinked-dvl is pre-1.0, so its public API may change while it is validated
-against production DVL installations.
+Pre-1.0. The public API may change while the package is validated against
+production installations. Changes are recorded in the release notes.
 
 ## Licence
 
@@ -142,7 +152,11 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 [ci]: https://github.com/sunfish-robotics/waterlinked-dvl/actions/workflows/ci.yml
 [ci-badge]: https://github.com/sunfish-robotics/waterlinked-dvl/actions/workflows/ci.yml/badge.svg
+[cli-reference]: https://pkg.go.dev/github.com/sunfish-robotics/waterlinked-dvl/cmd/waterlinked-dvl
 [go-reference]: https://pkg.go.dev/github.com/sunfish-robotics/waterlinked-dvl
 [license]: LICENSE
 [license-badge]: https://img.shields.io/badge/license-Apache--2.0-blue.svg
 [reference-badge]: https://pkg.go.dev/badge/github.com/sunfish-robotics/waterlinked-dvl.svg
+[wl-axes]: https://docs.waterlinked.com/dvl/axes/
+[wl-integration]: https://docs.waterlinked.com/dvl/integration/
+[wl-protocol]: https://docs.waterlinked.com/dvl/dvl-json-protocol/

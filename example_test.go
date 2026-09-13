@@ -194,3 +194,52 @@ func ExampleConn() {
 		}
 	}
 }
+
+func ExampleConn_Info() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := dvl.Dial(ctx, "192.168.194.95:16171")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	info, err := conn.Info(ctx)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("%s (%s) firmware %s ready=%t\n",
+		info.ProductName, info.Variant, info.FirmwareVersionShort, info.Ready)
+}
+
+func ExampleCommandError() {
+	ctx := context.Background()
+
+	conn, err := dvl.Dial(ctx, "192.168.194.95:16171")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	mode := dvl.RangeMode("2<=3")
+	err = conn.UpdateConfig(ctx, dvl.ConfigUpdate{RangeMode: &mode})
+
+	var rejected *dvl.CommandError
+	var protocol *dvl.ProtocolError
+	switch {
+	case err == nil:
+		log.Print("range mode updated")
+	case errors.As(err, &rejected):
+		// The device understood the command and refused it, so the connection
+		// is still usable and the device's message says why.
+		log.Printf("device rejected %s: %s", rejected.Command, rejected.Message)
+	case errors.As(err, &protocol):
+		// The device answered with something this package could not decode.
+		// Only a timeout or a mismatched response ends the connection; check
+		// conn.Err to tell the two apart.
+		log.Printf("protocol error: %v (connection error: %v)", protocol, conn.Err())
+	default:
+		log.Printf("update failed: %v", err)
+	}
+}
