@@ -28,17 +28,20 @@ func TestDecodeVelocityReportFromZoda(t *testing.T) {
 	if velocity.Interval != 189833405*time.Nanosecond {
 		t.Fatalf("interval = %s", velocity.Interval)
 	}
-	if velocity.Velocity.X != 0.00046143701183609664 {
-		t.Fatalf("vx = %v", velocity.Velocity.X)
+	if velocity.Measurement == nil {
+		t.Fatal("measurement is nil")
 	}
-	if velocity.Altitude == nil || *velocity.Altitude != 2.244393825531006 {
-		t.Fatalf("altitude = %v", velocity.Altitude)
+	if velocity.Measurement.Velocity.X != 0.00046143701183609664 {
+		t.Fatalf("vx = %v", velocity.Measurement.Velocity.X)
 	}
-	if velocity.Covariance[2][2] != 3.6557531307712665e-11 {
-		t.Fatalf("covariance[2][2] = %v", velocity.Covariance[2][2])
+	if velocity.Measurement.Altitude == nil || *velocity.Measurement.Altitude != 2.244393825531006 {
+		t.Fatalf("altitude = %v", velocity.Measurement.Altitude)
 	}
-	if !velocity.Valid || velocity.Status != 0 {
-		t.Fatalf("valid/status = %v/%d", velocity.Valid, velocity.Status)
+	if velocity.Measurement.Covariance[2][2] != 3.6557531307712665e-11 {
+		t.Fatalf("covariance[2][2] = %v", velocity.Measurement.Covariance[2][2])
+	}
+	if velocity.Status != 0 {
+		t.Fatalf("status = %d", velocity.Status)
 	}
 	if got := velocity.ValidAt; !got.Equal(time.UnixMicro(1789228180928221)) {
 		t.Fatalf("valid at = %s", got)
@@ -75,8 +78,48 @@ func TestDecodeWaterVelocityWithoutAltitude(t *testing.T) {
 	if velocity.Reference != VelocityReferenceWater {
 		t.Fatalf("reference = %q", velocity.Reference)
 	}
-	if velocity.Altitude != nil {
-		t.Fatalf("altitude = %v, want nil", *velocity.Altitude)
+	if velocity.Measurement == nil {
+		t.Fatal("measurement is nil")
+	}
+	if velocity.Measurement.Altitude != nil {
+		t.Fatalf("altitude = %v, want nil", *velocity.Measurement.Altitude)
+	}
+}
+
+func TestDecodeVelocityReportWithoutLockHasNoMeasurement(t *testing.T) {
+	t.Parallel()
+
+	// The live fixture carries stale, non-zero velocity and altitude in a
+	// velocity_valid:false report: the device does not zero them out when it
+	// loses lock.
+	var message map[string]any
+	if err := json.Unmarshal([]byte(velocityFixture), &message); err != nil {
+		t.Fatal(err)
+	}
+	message["velocity_valid"] = false
+	data, err := json.Marshal(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	velocity := decodeMessage(data).velocity
+	if velocity == nil {
+		t.Fatal("velocity report is nil")
+	}
+	if velocity.Measurement != nil {
+		t.Fatalf("measurement = %#v, want nil", velocity.Measurement)
+	}
+	if len(velocity.Transducers) != 4 {
+		t.Fatalf("transducers = %#v", velocity.Transducers)
+	}
+	if velocity.Status != 0 {
+		t.Fatalf("status = %d", velocity.Status)
+	}
+	if got := velocity.ValidAt; !got.Equal(time.UnixMicro(1789228180928221)) {
+		t.Fatalf("valid at = %s", got)
+	}
+	if got := velocity.TransmittedAt; !got.Equal(time.UnixMicro(1789228181074924)) {
+		t.Fatalf("transmitted at = %s", got)
 	}
 }
 

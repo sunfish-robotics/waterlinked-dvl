@@ -31,8 +31,8 @@ func readVelocity(ctx context.Context, conn *dvl.Conn) (dvl.Vector3, error) {
 			if !ok {
 				return dvl.Vector3{}, conn.Err()
 			}
-			if sample.Report.Valid {
-				return sample.Report.Velocity, nil
+			if sample.Report.Measurement != nil {
+				return sample.Report.Measurement.Velocity, nil
 			}
 		}
 	}

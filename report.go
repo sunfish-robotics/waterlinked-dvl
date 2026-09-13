@@ -86,12 +86,34 @@ type TransducerReading struct {
 	BeamValid bool
 }
 
-// VelocityReport is a bottom- or water-relative velocity calculation.
+// VelocityReport is one velocity calculation. The fields on the report itself
+// are meaningful whether or not the DVL has a lock; the measurement is present
+// only when it does.
 type VelocityReport struct {
 	Reference VelocityReference
 
 	// Interval is the elapsed time since the preceding velocity report.
 	Interval time.Duration
+
+	// Measurement is nil when the device reports velocity_valid false. The
+	// device still emits the report, with stale or meaningless numbers in the
+	// measurement fields, so they are withheld rather than passed through.
+	Measurement *VelocityMeasurement
+
+	Status        Status
+	ValidAt       time.Time
+	TransmittedAt time.Time
+
+	// Transducers carries per-beam diagnostics and is populated on every
+	// report, which is how loss of lock is diagnosed.
+	Transducers []TransducerReading
+
+	ProtocolVersion ProtocolVersion
+}
+
+// VelocityMeasurement is the part of a velocity report that is only valid
+// while the DVL has a lock on the reflecting surface.
+type VelocityMeasurement struct {
 	Velocity Vector3
 
 	// FigureOfMerit is the estimated velocity standard deviation in metres per
@@ -102,16 +124,9 @@ type VelocityReport struct {
 	Covariance Matrix3
 
 	// Altitude is the distance to the reflecting surface along the emitted Z
-	// axis, in metres. It is nil when the device omits altitude.
+	// axis, in metres. It is nil when the device omits altitude, which is the
+	// case in water tracking.
 	Altitude *float64
-
-	Valid         bool
-	Status        Status
-	ValidAt       time.Time
-	TransmittedAt time.Time
-	Transducers   []TransducerReading
-
-	ProtocolVersion ProtocolVersion
 }
 
 // DeadReckoningStatus is the raw status value on a position_local report.

@@ -29,7 +29,9 @@ supports:
   longer than the size cap, a failed command write, a command the device leaves
   unanswered for 30 seconds, or a response naming a command other than the one
   in flight;
-- complete timing, covariance, validity, status, and per-transducer fields;
+- complete timing, status, and per-transducer fields on every velocity report,
+  with the velocity, figure of merit, covariance, and altitude measurement
+  withheld (rather than passed through stale) when the DVL has no lock;
 - typed device identity and configuration commands;
 - interleaved report and command-response handling;
 - broadcast connection lifecycle with a durable terminal error; and

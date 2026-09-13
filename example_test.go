@@ -26,15 +26,15 @@ func ExampleConn_VelocityReports() {
 		}
 
 		report := sample.Report
-		if !report.Valid {
+		if report.Measurement == nil {
 			continue
 		}
 		log.Printf(
 			"%s-relative velocity: x=%.3f y=%.3f z=%.3f m/s",
 			report.Reference,
-			report.Velocity.X,
-			report.Velocity.Y,
-			report.Velocity.Z,
+			report.Measurement.Velocity.X,
+			report.Measurement.Velocity.Y,
+			report.Measurement.Velocity.Z,
 		)
 	}
 

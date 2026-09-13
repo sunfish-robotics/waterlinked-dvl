@@ -241,14 +241,20 @@ func decodeVelocityReport(data []byte) (*VelocityReport, error) {
 		reference = VelocityReferenceWater
 	}
 
+	var measurement *VelocityMeasurement
+	if *wire.VelocityValid {
+		measurement = &VelocityMeasurement{
+			Velocity:      Vector3{X: *wire.VX, Y: *wire.VY, Z: *wire.VZ},
+			FigureOfMerit: *wire.FigureOfMerit,
+			Covariance:    covariance,
+			Altitude:      wire.Altitude,
+		}
+	}
+
 	return &VelocityReport{
 		Reference:       reference,
 		Interval:        interval,
-		Velocity:        Vector3{X: *wire.VX, Y: *wire.VY, Z: *wire.VZ},
-		FigureOfMerit:   *wire.FigureOfMerit,
-		Covariance:      covariance,
-		Altitude:        wire.Altitude,
-		Valid:           *wire.VelocityValid,
+		Measurement:     measurement,
 		Status:          Status(*wire.Status),
 		ValidAt:         time.UnixMicro(*wire.TimeOfValidity).UTC(),
 		TransmittedAt:   time.UnixMicro(*wire.TimeOfTransmission).UTC(),
