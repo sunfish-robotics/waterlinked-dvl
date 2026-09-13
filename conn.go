@@ -42,12 +42,12 @@ type connState struct {
 	deadReckoning reportStream[*DeadReckoningReport]
 	unknown       reportStream[*UnknownReport]
 	commands      chan commandRequest
-	done          chan struct{}
 	workers       sync.WaitGroup
 
-	terminalOnce sync.Once
-	errMu        sync.RWMutex
-	terminalErr  error
+	// ctx is cancelled exactly once, when the connection ends.
+	// context.Cause(ctx) is the terminal error.
+	ctx    context.Context
+	cancel context.CancelCauseFunc
 
 	pendingMu sync.Mutex
 	pending   *pendingCommand
@@ -87,13 +87,17 @@ func Dial(ctx context.Context, address string) (*Conn, error) {
 		return nil, fmt.Errorf("dvl: dial %s: %w", address, err)
 	}
 
+	// The connection's lifetime is deliberately rooted in Background rather
+	// than ctx: cancelling ctx after Dial returns must not end the connection.
+	lifetime, cancel := context.WithCancelCause(context.Background())
 	state := &connState{
 		socket:        socket,
 		velocity:      newReportStream[*VelocityReport](),
 		deadReckoning: newReportStream[*DeadReckoningReport](),
 		unknown:       newReportStream[*UnknownReport](),
 		commands:      make(chan commandRequest),
-		done:          make(chan struct{}),
+		ctx:           lifetime,
+		cancel:        cancel,
 	}
 	conn := &Conn{state: state}
 
@@ -104,9 +108,9 @@ func Dial(ctx context.Context, address string) (*Conn, error) {
 			worker()
 		}()
 	}
-	start(func() { state.velocity.run(state.done) })
-	start(func() { state.deadReckoning.run(state.done) })
-	start(func() { state.unknown.run(state.done) })
+	start(func() { state.velocity.run(state.ctx.Done()) })
+	start(func() { state.deadReckoning.run(state.ctx.Done()) })
+	start(func() { state.unknown.run(state.ctx.Done()) })
 	start(state.runCommands)
 	start(state.readMessages)
 
@@ -143,20 +147,13 @@ func (c *Conn) UnknownReports() <-chan Sample[*UnknownReport] {
 // Done is closed when the connection ends. It is a broadcast lifecycle signal
 // for supervisors and callers that do not consume report streams.
 func (c *Conn) Done() <-chan struct{} {
-	return c.state.done
+	return c.state.ctx.Done()
 }
 
 // Err returns nil while the connection is active and its terminal cause after
 // Done is closed. The cause is stable and is not consumed by reading it.
 func (c *Conn) Err() error {
-	select {
-	case <-c.state.done:
-		c.state.errMu.RLock()
-		defer c.state.errMu.RUnlock()
-		return c.state.terminalErr
-	default:
-		return nil
-	}
+	return context.Cause(c.state.ctx)
 }
 
 // Info returns the connected device's identity, firmware version, and
@@ -257,7 +254,7 @@ func (c *Conn) command(
 	case c.state.commands <- request:
 	case <-ctx.Done():
 		return commandResponse{}, ctx.Err()
-	case <-c.state.done:
+	case <-c.state.ctx.Done():
 		return commandResponse{}, c.Err()
 	}
 
@@ -281,12 +278,12 @@ func (c *Conn) command(
 func (s *connState) runCommands() {
 	for {
 		select {
-		case <-s.done:
+		case <-s.ctx.Done():
 			return
 		case request := <-s.commands:
 			select {
-			case <-s.done:
-				request.complete <- commandResult{err: s.err()}
+			case <-s.ctx.Done():
+				request.complete <- commandResult{err: context.Cause(s.ctx)}
 				return
 			default:
 			}
@@ -313,7 +310,7 @@ func (s *connState) runCommand(request commandRequest) {
 		s.clearPending(pending)
 		terminalErr := fmt.Errorf("dvl: write command %q: %w", request.name, err)
 		s.terminate(terminalErr)
-		request.complete <- commandResult{err: s.err()}
+		request.complete <- commandResult{err: context.Cause(s.ctx)}
 		return
 	}
 
@@ -337,8 +334,8 @@ func (s *connState) runCommand(request commandRequest) {
 			Err:         context.DeadlineExceeded,
 		}
 		s.terminate(terminalErr)
-		request.complete <- commandResult{err: s.err()}
-	case <-s.done:
+		request.complete <- commandResult{err: context.Cause(s.ctx)}
+	case <-s.ctx.Done():
 		select {
 		case response := <-pending.response:
 			s.finishCommand(request, pending, response)
@@ -346,7 +343,7 @@ func (s *connState) runCommand(request commandRequest) {
 		default:
 		}
 		s.clearPending(pending)
-		request.complete <- commandResult{err: s.err()}
+		request.complete <- commandResult{err: context.Cause(s.ctx)}
 	}
 }
 
@@ -361,7 +358,7 @@ func (s *connState) finishCommand(request commandRequest, pending *pendingComman
 				Err:         err,
 			}
 			s.terminate(terminalErr)
-			request.complete <- commandResult{err: s.err()}
+			request.complete <- commandResult{err: context.Cause(s.ctx)}
 			return
 		}
 	}
@@ -427,19 +424,19 @@ func (s *connState) readMessages() {
 			continue
 		}
 		if message.velocity != nil {
-			if !s.velocity.publish(s.done, message.velocity) {
+			if !s.velocity.publish(s.ctx.Done(), message.velocity) {
 				return
 			}
 			continue
 		}
 		if message.deadReckoning != nil {
-			if !s.deadReckoning.publish(s.done, message.deadReckoning) {
+			if !s.deadReckoning.publish(s.ctx.Done(), message.deadReckoning) {
 				return
 			}
 			continue
 		}
 		if message.unknown != nil {
-			if !s.unknown.publish(s.done, message.unknown) {
+			if !s.unknown.publish(s.ctx.Done(), message.unknown) {
 				return
 			}
 			continue
@@ -499,28 +496,20 @@ func (s *connState) deliverResponse(response commandResponse) bool {
 	select {
 	case <-pending.processed:
 		return true
-	case <-s.done:
+	case <-s.ctx.Done():
 		return false
 	}
 }
 
+// terminate ends the connection with err as its terminal cause, mapping a nil
+// err to io.EOF. Only the first call sets the cause; later calls leave it
+// unchanged, so terminate is safe to call repeatedly and from any goroutine.
 func (s *connState) terminate(err error) {
 	if err == nil {
 		err = io.EOF
 	}
-	s.terminalOnce.Do(func() {
-		s.errMu.Lock()
-		s.terminalErr = err
-		s.errMu.Unlock()
-		_ = s.socket.Close()
-		close(s.done)
-	})
-}
-
-func (s *connState) err() error {
-	s.errMu.RLock()
-	defer s.errMu.RUnlock()
-	return s.terminalErr
+	s.cancel(err)
+	_ = s.socket.Close()
 }
 
 // CommandError reports a syntactically valid command rejected by the device.
