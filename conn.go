@@ -55,8 +55,8 @@ type connState struct {
 	idleTimeout    time.Duration
 	commandTimeout time.Duration
 
-	velocity      reportStream[*VelocityReport]
-	deadReckoning reportStream[*DeadReckoningReport]
+	velocity      reportStream[VelocityReport]
+	deadReckoning reportStream[DeadReckoningReport]
 	unhandled     reportStream[UnhandledFrame]
 	commands      chan commandRequest
 	workers       sync.WaitGroup
@@ -168,8 +168,8 @@ func (d *Dialer) Dial(ctx context.Context, address string) (*Conn, error) {
 		socket:         socket,
 		idleTimeout:    d.IdleTimeout,
 		commandTimeout: commandTimeout,
-		velocity:       newReportStream[*VelocityReport](reportBuffer),
-		deadReckoning:  newReportStream[*DeadReckoningReport](reportBuffer),
+		velocity:       newReportStream[VelocityReport](reportBuffer),
+		deadReckoning:  newReportStream[DeadReckoningReport](reportBuffer),
 		unhandled:      newReportStream[UnhandledFrame](reportBuffer),
 		commands:       make(chan commandRequest),
 		ctx:            lifetime,
@@ -208,14 +208,14 @@ func Dial(ctx context.Context, address string) (*Conn, error) {
 // being read. Each Sample reports velocity-stream loss. The channel closes when
 // the connection ends, and buffered reports from that connection epoch are
 // discarded.
-func (c *Conn) VelocityReports() <-chan Sample[*VelocityReport] {
+func (c *Conn) VelocityReports() <-chan Sample[VelocityReport] {
 	return c.state.velocity.output
 }
 
 // DeadReckoningReports returns local position and orientation reports. Its
 // buffering and receiver semantics match VelocityReports, with independent
 // loss accounting.
-func (c *Conn) DeadReckoningReports() <-chan Sample[*DeadReckoningReport] {
+func (c *Conn) DeadReckoningReports() <-chan Sample[DeadReckoningReport] {
 	return c.state.deadReckoning.output
 }
 
@@ -520,11 +520,11 @@ func (s *connState) readMessages() {
 				return
 			}
 		case message.velocity != nil:
-			if !s.velocity.publish(s.ctx.Done(), message.velocity) {
+			if !s.velocity.publish(s.ctx.Done(), *message.velocity) {
 				return
 			}
 		case message.deadReckoning != nil:
-			if !s.deadReckoning.publish(s.ctx.Done(), message.deadReckoning) {
+			if !s.deadReckoning.publish(s.ctx.Done(), *message.deadReckoning) {
 				return
 			}
 		case message.unhandled != nil:

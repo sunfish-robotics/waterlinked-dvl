@@ -45,8 +45,8 @@ func TestConnDemultiplexesReportAndCommandResponse(t *testing.T) {
 
 	select {
 	case sample := <-conn.VelocityReports():
-		if sample.Report == nil {
-			t.Fatal("velocity report is nil")
+		if sample.Report.Measurement == nil {
+			t.Fatal("velocity report has no measurement")
 		}
 		if sample.DroppedBefore != 0 {
 			t.Fatalf("dropped = %d", sample.DroppedBefore)
@@ -101,7 +101,7 @@ func TestSlowVelocityConsumerDoesNotBlockOtherStreamsOrCommands(t *testing.T) {
 
 	select {
 	case sample := <-conn.DeadReckoningReports():
-		if sample.Report == nil || sample.DroppedBefore != 0 {
+		if sample.DroppedBefore != 0 {
 			t.Fatalf("dead-reckoning sample = %#v", sample)
 		}
 	case <-ctx.Done():
