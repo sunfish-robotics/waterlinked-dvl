@@ -3,12 +3,17 @@ package dvl
 type reportStream[T any] struct {
 	input  chan T
 	output chan Sample[T]
+
+	// capacity is how many reports the broker retains before dropping the
+	// oldest. The dialer resolves it once, so it is fixed for the connection.
+	capacity int
 }
 
-func newReportStream[T any]() reportStream[T] {
+func newReportStream[T any](capacity int) reportStream[T] {
 	return reportStream[T]{
-		input:  make(chan T),
-		output: make(chan Sample[T]),
+		input:    make(chan T),
+		output:   make(chan Sample[T]),
+		capacity: capacity,
 	}
 }
 
@@ -24,7 +29,7 @@ func (s *reportStream[T]) publish(done <-chan struct{}, report T) bool {
 func (s *reportStream[T]) run(done <-chan struct{}) {
 	defer close(s.output)
 
-	queue := make([]T, reportBufferCapacity)
+	queue := make([]T, s.capacity)
 	head := 0
 	size := 0
 	var dropped uint64

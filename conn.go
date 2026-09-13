@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -17,9 +18,10 @@ const (
 	// DefaultPort is the TCP port used by the A50/A125 JSON protocol.
 	DefaultPort = 16171
 
-	reportBufferCapacity   = 64
-	maximumFrameSize       = 1 << 20
-	commandResponseTimeout = 30 * time.Second
+	maximumFrameSize = 1 << 20
+
+	defaultReportBuffer   = 64
+	defaultCommandTimeout = 30 * time.Second
 )
 
 var errNilContext = errors.New("dvl: nil context")
@@ -34,16 +36,24 @@ var errNilContext = errors.New("dvl: nil context")
 // correlation remains unambiguous.
 //
 // A connection ends on Close, on a transport failure or EOF, on a frame longer
-// than the protocol's size cap, on a failed command write, on a command the
-// device leaves unanswered for 30 seconds, and on a response that names a
-// command other than the one in flight. Everything else the device sends that
-// the package cannot decode is reported on UnhandledFrames instead.
+// than the protocol's size cap, on a failed command write, on the dialer's idle
+// timeout elapsing with no complete frame, on a command the device leaves
+// unanswered for the dialer's command timeout, and on a response that names a
+// command other than the one in flight. An unanswered command ends the
+// connection because a response that arrives after the wait could no longer be
+// told apart from the response to the command after it. Everything else the
+// device sends that the package cannot decode is reported on UnhandledFrames
+// instead.
 type Conn struct {
 	state *connState
 }
 
 type connState struct {
 	socket net.Conn
+
+	// Dialer settings, resolved to their defaults once at dial time.
+	idleTimeout    time.Duration
+	commandTimeout time.Duration
 
 	velocity      reportStream[*VelocityReport]
 	deadReckoning reportStream[*DeadReckoningReport]
@@ -84,16 +94,66 @@ type pendingCommand struct {
 	processed chan struct{}
 }
 
-// Dial connects to address, which must include a TCP port.
+// Dialer configures how connections are opened and supervised. The zero value
+// is ready to use and matches Dial.
+type Dialer struct {
+	// NetDialer opens the TCP connection. When nil a zero net.Dialer is used,
+	// which enables the operating system's TCP keep-alive with Go's defaults.
+	NetDialer *net.Dialer
+
+	// IdleTimeout ends the connection when no complete frame has arrived for
+	// this long. The terminal error wraps the underlying deadline error, so
+	// errors.Is(err, os.ErrDeadlineExceeded) reports true. Zero disables the
+	// check. A device with acoustics disabled may legitimately send nothing,
+	// so choose a value with that in mind.
+	IdleTimeout time.Duration
+
+	// CommandTimeout bounds how long a command waits for the device's
+	// response. When it expires the connection ends with a *ProtocolError
+	// wrapping context.DeadlineExceeded, because a response arriving later
+	// could be matched to the wrong command. Zero uses 30 seconds.
+	CommandTimeout time.Duration
+
+	// ReportBuffer is the number of reports each typed stream retains for a
+	// slow consumer before dropping the oldest. Zero uses 64.
+	ReportBuffer int
+}
+
+// Dial connects to address using d.
 //
-// Cancelling ctx while dialing returns an error comparable with ctx.Err. Once
-// Dial succeeds, cancelling ctx has no effect on the returned connection.
-func Dial(ctx context.Context, address string) (*Conn, error) {
+// address must include a TCP port. A negative field on d is rejected before any
+// network activity. Cancelling ctx while dialing returns an error comparable
+// with ctx.Err; once Dial succeeds, cancelling ctx has no effect on the
+// returned connection. Dial resolves d's zero fields to their defaults for this
+// connection and never writes to d, so one Dialer may open many connections.
+func (d *Dialer) Dial(ctx context.Context, address string) (*Conn, error) {
 	if ctx == nil {
 		return nil, errNilContext
 	}
+	if d.IdleTimeout < 0 {
+		return nil, fmt.Errorf("dvl: negative IdleTimeout %s", d.IdleTimeout)
+	}
+	if d.CommandTimeout < 0 {
+		return nil, fmt.Errorf("dvl: negative CommandTimeout %s", d.CommandTimeout)
+	}
+	if d.ReportBuffer < 0 {
+		return nil, fmt.Errorf("dvl: negative ReportBuffer %d", d.ReportBuffer)
+	}
 
-	socket, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	netDialer := d.NetDialer
+	if netDialer == nil {
+		netDialer = &net.Dialer{}
+	}
+	commandTimeout := d.CommandTimeout
+	if commandTimeout == 0 {
+		commandTimeout = defaultCommandTimeout
+	}
+	reportBuffer := d.ReportBuffer
+	if reportBuffer == 0 {
+		reportBuffer = defaultReportBuffer
+	}
+
+	socket, err := netDialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("dvl: dial %s: %w", address, err)
 	}
@@ -102,13 +162,15 @@ func Dial(ctx context.Context, address string) (*Conn, error) {
 	// than ctx: cancelling ctx after Dial returns must not end the connection.
 	lifetime, cancel := context.WithCancelCause(context.Background())
 	state := &connState{
-		socket:        socket,
-		velocity:      newReportStream[*VelocityReport](),
-		deadReckoning: newReportStream[*DeadReckoningReport](),
-		unhandled:     newReportStream[UnhandledFrame](),
-		commands:      make(chan commandRequest),
-		ctx:           lifetime,
-		cancel:        cancel,
+		socket:         socket,
+		idleTimeout:    d.IdleTimeout,
+		commandTimeout: commandTimeout,
+		velocity:       newReportStream[*VelocityReport](reportBuffer),
+		deadReckoning:  newReportStream[*DeadReckoningReport](reportBuffer),
+		unhandled:      newReportStream[UnhandledFrame](reportBuffer),
+		commands:       make(chan commandRequest),
+		ctx:            lifetime,
+		cancel:         cancel,
 	}
 	conn := &Conn{state: state}
 
@@ -126,6 +188,12 @@ func Dial(ctx context.Context, address string) (*Conn, error) {
 	start(state.readMessages)
 
 	return conn, nil
+}
+
+// Dial connects to address with a zero Dialer. Dialer.Dial documents the
+// contract the returned connection follows.
+func Dial(ctx context.Context, address string) (*Conn, error) {
+	return (&Dialer{}).Dial(ctx, address)
 }
 
 // VelocityReports returns bottom- and water-relative velocity reports. Repeated
@@ -330,7 +398,7 @@ func (s *connState) runCommand(request commandRequest) {
 		return
 	}
 
-	timer := time.NewTimer(commandResponseTimeout)
+	timer := time.NewTimer(s.commandTimeout)
 	defer timer.Stop()
 
 	select {
@@ -390,7 +458,7 @@ func (s *connState) finishCommand(request commandRequest, pending *pendingComman
 }
 
 func (s *connState) writeCommand(payload []byte) (err error) {
-	if err = s.socket.SetWriteDeadline(time.Now().Add(commandResponseTimeout)); err != nil {
+	if err = s.socket.SetWriteDeadline(time.Now().Add(s.commandTimeout)); err != nil {
 		return err
 	}
 	defer func() {
@@ -425,7 +493,15 @@ func (s *connState) readMessages() {
 	scanner := bufio.NewScanner(s.socket)
 	scanner.Buffer(make([]byte, 4096), maximumFrameSize)
 
-	for scanner.Scan() {
+	for {
+		if err := s.armIdleDeadline(); err != nil {
+			s.terminate(fmt.Errorf("dvl: read: %w", err))
+			return
+		}
+		if !scanner.Scan() {
+			break
+		}
+
 		frame := bytes.TrimSpace(scanner.Bytes())
 		if len(frame) == 0 {
 			continue
@@ -466,10 +542,24 @@ func (s *connState) readMessages() {
 	}
 
 	if err := scanner.Err(); err != nil {
+		if s.idleTimeout != 0 && errors.Is(err, os.ErrDeadlineExceeded) {
+			s.terminate(fmt.Errorf("dvl: no frame received for %s: %w", s.idleTimeout, err))
+			return
+		}
 		s.terminate(fmt.Errorf("dvl: read: %w", err))
 		return
 	}
 	s.terminate(io.EOF)
+}
+
+// armIdleDeadline gives the next scan the configured idle timeout to produce a
+// frame. A zero idle timeout leaves the socket without a read deadline, which
+// is how it was dialled.
+func (s *connState) armIdleDeadline() error {
+	if s.idleTimeout == 0 {
+		return nil
+	}
+	return s.socket.SetReadDeadline(time.Now().Add(s.idleTimeout))
 }
 
 // reportUnhandled publishes frame on the unhandled stream, except when it is a

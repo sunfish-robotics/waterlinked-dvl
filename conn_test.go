@@ -62,7 +62,7 @@ func TestConnDemultiplexesReportAndCommandResponse(t *testing.T) {
 func TestSlowVelocityConsumerDoesNotBlockOtherStreamsOrCommands(t *testing.T) {
 	release := make(chan struct{})
 	peer := startTestPeer(t, func(socket net.Conn) error {
-		for index := range reportBufferCapacity + 6 {
+		for index := range defaultReportBuffer + 6 {
 			if err := writeTestFrame(socket, velocityFrame(float64(index))); err != nil {
 				return err
 			}
@@ -748,9 +748,14 @@ func (p testPeer) wait(t *testing.T) {
 
 func dialTestPeer(t *testing.T, address string) *Conn {
 	t.Helper()
+	return dialTestPeerWith(t, &Dialer{}, address)
+}
+
+func dialTestPeerWith(t *testing.T, dialer *Dialer, address string) *Conn {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	conn, err := Dial(ctx, address)
+	conn, err := dialer.Dial(ctx, address)
 	if err != nil {
 		t.Fatal(err)
 	}

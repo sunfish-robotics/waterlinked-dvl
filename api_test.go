@@ -12,6 +12,7 @@ import (
 var (
 	_ io.Closer                                        = (*dvl.Conn)(nil)
 	_ func(context.Context, string) (*dvl.Conn, error) = dvl.Dial
+	_ func(context.Context, string) (*dvl.Conn, error) = (&dvl.Dialer{}).Dial
 	_ interface {
 		VelocityReports() <-chan dvl.Sample[*dvl.VelocityReport]
 		DeadReckoningReports() <-chan dvl.Sample[*dvl.DeadReckoningReport]
