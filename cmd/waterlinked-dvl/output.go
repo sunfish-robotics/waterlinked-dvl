@@ -61,18 +61,21 @@ type transducerOutput struct {
 }
 
 type velocityOutput struct {
-	Reference            dvl.VelocityReference `json:"reference"`
-	IntervalMilliseconds float64               `json:"interval_milliseconds"`
-	Velocity             vectorOutput          `json:"velocity_metres_per_second"`
-	FigureOfMerit        float64               `json:"figure_of_merit_metres_per_second"`
-	Covariance           dvl.Matrix3           `json:"covariance_metres_squared_per_second_squared"`
-	AltitudeMetres       *float64              `json:"altitude_metres"`
-	Valid                bool                  `json:"valid"`
-	Status               uint8                 `json:"status"`
-	ValidAt              time.Time             `json:"valid_at"`
-	TransmittedAt        time.Time             `json:"transmitted_at"`
-	Transducers          []transducerOutput    `json:"transducers"`
-	ProtocolVersion      dvl.ProtocolVersion   `json:"protocol_version"`
+	Reference            dvl.VelocityReference      `json:"reference"`
+	IntervalMilliseconds float64                    `json:"interval_milliseconds"`
+	Measurement          *velocityMeasurementOutput `json:"measurement"`
+	Status               uint8                      `json:"status"`
+	ValidAt              time.Time                  `json:"valid_at"`
+	TransmittedAt        time.Time                  `json:"transmitted_at"`
+	Transducers          []transducerOutput         `json:"transducers"`
+	ProtocolVersion      dvl.ProtocolVersion        `json:"protocol_version"`
+}
+
+type velocityMeasurementOutput struct {
+	Velocity       vectorOutput `json:"velocity_metres_per_second"`
+	FigureOfMerit  float64      `json:"figure_of_merit_metres_per_second"`
+	Covariance     dvl.Matrix3  `json:"covariance_metres_squared_per_second_squared"`
+	AltitudeMetres *float64     `json:"altitude_metres"`
 }
 
 type deadReckoningOutput struct {
@@ -84,10 +87,11 @@ type deadReckoningOutput struct {
 	ProtocolVersion                   dvl.ProtocolVersion     `json:"protocol_version"`
 }
 
-type unknownOutput struct {
+type unhandledOutput struct {
 	Type            string              `json:"type"`
 	ProtocolVersion dvl.ProtocolVersion `json:"protocol_version"`
-	Raw             json.RawMessage     `json:"raw"`
+	Raw             string              `json:"raw"`
+	Error           string              `json:"error,omitempty"`
 }
 
 type reportEvent struct {
@@ -174,28 +178,39 @@ func writeConfigUpdate(w io.Writer, asJSON bool, selected []string, before, afte
 	return err
 }
 
-func writeVelocity(w io.Writer, asJSON bool, sample dvl.Sample[*dvl.VelocityReport]) error {
+func writeVelocity(w io.Writer, asJSON bool, sample dvl.Sample[dvl.VelocityReport]) error {
 	report := sample.Report
 	value := velocityValue(report)
 	if asJSON {
 		return writeJSON(w, reportEvent{Type: "velocity", DroppedBefore: sample.DroppedBefore, Report: value}, false)
 	}
 
+	if report.Measurement == nil {
+		_, err := fmt.Fprintf(
+			w,
+			"%s velocity %-6s valid=false status=%d transducers=%d dropped=%d\n",
+			report.TransmittedAt.Format(time.RFC3339Nano), report.Reference,
+			report.Status, len(report.Transducers), sample.DroppedBefore,
+		)
+		return err
+	}
+
+	measurement := report.Measurement
 	altitude := "n/a"
-	if report.Altitude != nil {
-		altitude = fmt.Sprintf("%.3f m", *report.Altitude)
+	if measurement.Altitude != nil {
+		altitude = fmt.Sprintf("%.3f m", *measurement.Altitude)
 	}
 	_, err := fmt.Fprintf(
 		w,
-		"%s velocity %-6s valid=%t x=% .3f y=% .3f z=% .3f m/s altitude=%s fom=%.3f dropped=%d\n",
-		report.TransmittedAt.Format(time.RFC3339Nano), report.Reference, report.Valid,
-		report.Velocity.X, report.Velocity.Y, report.Velocity.Z, altitude,
-		report.FigureOfMerit, sample.DroppedBefore,
+		"%s velocity %-6s valid=true x=% .3f y=% .3f z=% .3f m/s altitude=%s fom=%.3f dropped=%d\n",
+		report.TransmittedAt.Format(time.RFC3339Nano), report.Reference,
+		measurement.Velocity.X, measurement.Velocity.Y, measurement.Velocity.Z, altitude,
+		measurement.FigureOfMerit, sample.DroppedBefore,
 	)
 	return err
 }
 
-func writeDeadReckoning(w io.Writer, asJSON bool, sample dvl.Sample[*dvl.DeadReckoningReport]) error {
+func writeDeadReckoning(w io.Writer, asJSON bool, sample dvl.Sample[dvl.DeadReckoningReport]) error {
 	report := sample.Report
 	value := deadReckoningValue(report)
 	if asJSON {
@@ -212,15 +227,22 @@ func writeDeadReckoning(w io.Writer, asJSON bool, sample dvl.Sample[*dvl.DeadRec
 	return err
 }
 
-func writeUnknown(w io.Writer, asJSON bool, sample dvl.Sample[*dvl.UnknownReport]) error {
+func writeUnhandled(w io.Writer, asJSON bool, sample dvl.Sample[dvl.UnhandledFrame]) error {
 	report := sample.Report
-	value := unknownOutput{Type: report.Type, ProtocolVersion: report.ProtocolVersion, Raw: report.Raw}
+	value := unhandledOutput{
+		Type:            report.Type,
+		ProtocolVersion: report.ProtocolVersion,
+		Raw:             string(report.Raw),
+	}
+	if report.Err != nil {
+		value.Error = report.Err.Error()
+	}
 	if asJSON {
-		return writeJSON(w, reportEvent{Type: "unknown", DroppedBefore: sample.DroppedBefore, Report: value}, false)
+		return writeJSON(w, reportEvent{Type: "unhandled", DroppedBefore: sample.DroppedBefore, Report: value}, false)
 	}
 
-	_, err := fmt.Fprintf(w, "unknown report type=%q format=%s dropped=%d raw=%s\n",
-		report.Type, report.ProtocolVersion, sample.DroppedBefore, report.Raw)
+	_, err := fmt.Fprintf(w, "unhandled frame type=%q format=%s dropped=%d error=%q raw=%q\n",
+		report.Type, report.ProtocolVersion, sample.DroppedBefore, value.Error, value.Raw)
 	return err
 }
 
@@ -246,7 +268,7 @@ func configValue(config dvl.Config) configOutput {
 	}
 }
 
-func velocityValue(report *dvl.VelocityReport) velocityOutput {
+func velocityValue(report dvl.VelocityReport) velocityOutput {
 	transducers := make([]transducerOutput, len(report.Transducers))
 	for index, transducer := range report.Transducers {
 		transducers[index] = transducerOutput{
@@ -254,16 +276,24 @@ func velocityValue(report *dvl.VelocityReport) velocityOutput {
 			RSSI: transducer.RSSI, NSD: transducer.NSD, BeamValid: transducer.BeamValid,
 		}
 	}
-	return velocityOutput{
+	value := velocityOutput{
 		Reference: report.Reference, IntervalMilliseconds: float64(report.Interval) / float64(time.Millisecond),
-		Velocity:      vectorOutput{X: report.Velocity.X, Y: report.Velocity.Y, Z: report.Velocity.Z},
-		FigureOfMerit: report.FigureOfMerit, Covariance: report.Covariance, AltitudeMetres: report.Altitude,
-		Valid: report.Valid, Status: uint8(report.Status), ValidAt: report.ValidAt, TransmittedAt: report.TransmittedAt,
+		Status: uint8(report.Status), ValidAt: report.ValidAt, TransmittedAt: report.TransmittedAt,
 		Transducers: transducers, ProtocolVersion: report.ProtocolVersion,
 	}
+	if report.Measurement != nil {
+		measurement := report.Measurement
+		value.Measurement = &velocityMeasurementOutput{
+			Velocity:       vectorOutput{X: measurement.Velocity.X, Y: measurement.Velocity.Y, Z: measurement.Velocity.Z},
+			FigureOfMerit:  measurement.FigureOfMerit,
+			Covariance:     measurement.Covariance,
+			AltitudeMetres: measurement.Altitude,
+		}
+	}
+	return value
 }
 
-func deadReckoningValue(report *dvl.DeadReckoningReport) deadReckoningOutput {
+func deadReckoningValue(report dvl.DeadReckoningReport) deadReckoningOutput {
 	return deadReckoningOutput{
 		At:                                report.At,
 		PositionMetres:                    vectorOutput{X: report.Position.X, Y: report.Position.Y, Z: report.Position.Z},

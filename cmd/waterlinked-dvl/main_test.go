@@ -205,8 +205,10 @@ func TestSimpleCommandDispatch(t *testing.T) {
 }
 
 func TestWatchWritesEachTypedReportAsJSONL(t *testing.T) {
+	noLock := velocityCLIFrame()
+	noLock["velocity_valid"] = false
 	peer := startCLITestPeer(t, func(socket net.Conn) error {
-		for _, frame := range []any{velocityCLIFrame(), deadReckoningCLIFrame(), map[string]any{
+		for _, frame := range []any{velocityCLIFrame(), noLock, deadReckoningCLIFrame(), map[string]any{
 			"type": "temperature", "format": "json_v3.3", "value": 21.5,
 		}} {
 			if err := writeCLIFrame(socket, frame); err != nil {
@@ -227,23 +229,37 @@ func TestWatchWritesEachTypedReportAsJSONL(t *testing.T) {
 	peer.wait(t)
 
 	seen := make(map[string]bool)
+	sawNoLock := false
 	scanner := bufio.NewScanner(&stdout)
 	for scanner.Scan() {
 		var event struct {
-			Type string `json:"type"`
+			Type   string          `json:"type"`
+			Report json.RawMessage `json:"report"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
 			t.Fatalf("decode %q: %v", scanner.Text(), err)
 		}
 		seen[event.Type] = true
+		if event.Type == "velocity" {
+			var report struct {
+				Measurement json.RawMessage `json:"measurement"`
+			}
+			if err := json.Unmarshal(event.Report, &report); err != nil {
+				t.Fatal(err)
+			}
+			sawNoLock = sawNoLock || bytes.Equal(report.Measurement, []byte("null"))
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		t.Fatal(err)
 	}
-	for _, reportType := range []string{"velocity", "dead_reckoning", "unknown"} {
+	for _, reportType := range []string{"velocity", "dead_reckoning", "unhandled"} {
 		if !seen[reportType] {
 			t.Fatalf("missing %q event in %s", reportType, stdout.String())
 		}
+	}
+	if !sawNoLock {
+		t.Fatalf("no-lock velocity report did not contain a null measurement: %s", stdout.String())
 	}
 }
 

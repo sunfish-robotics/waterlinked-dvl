@@ -181,7 +181,7 @@ func runWatch(ctx context.Context, args []string, output commandIO) error {
 
 	velocity := conn.VelocityReports()
 	deadReckoning := conn.DeadReckoningReports()
-	unknown := conn.UnknownReports()
+	unhandled := conn.UnhandledFrames()
 	for {
 		select {
 		case sample, ok := <-velocity:
@@ -200,12 +200,12 @@ func runWatch(ctx context.Context, args []string, output commandIO) error {
 			if err := writeDeadReckoning(output.stdout, *flags.json, sample); err != nil {
 				return err
 			}
-		case sample, ok := <-unknown:
+		case sample, ok := <-unhandled:
 			if !ok {
-				unknown = nil
+				unhandled = nil
 				continue
 			}
-			if err := writeUnknown(output.stdout, *flags.json, sample); err != nil {
+			if err := writeUnhandled(output.stdout, *flags.json, sample); err != nil {
 				return err
 			}
 		case <-watchCtx.Done():
